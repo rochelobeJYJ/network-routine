@@ -15,5 +15,7 @@ release_py313_admin/
 network_routine_settings.json
 network_routine.log
 compile_check.pyc*
+내부망.bat
+외부망.bat
 
 *.tmp

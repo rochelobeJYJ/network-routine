@@ -25,17 +25,43 @@ APP_FOLDER = "network_routine"
 SETTINGS_NAME = "network_routine_settings.json"
 LOG_NAME = "network_routine.log"
 DEV_LOG_ENV = "NETWORK_ROUTINE_DEV_LOG"
-TASK_MINUTE = "NetworkRoutine_Reconcile_Minutely"
+TASK_SCHEDULE = "NetworkRoutine_Reconcile_Schedule"
 TASK_LOGON = "NetworkRoutine_Reconcile_Logon"
+TASK_UNLOCK = "NetworkRoutine_Reconcile_Unlock"
+TASK_CONSOLE = "NetworkRoutine_Reconcile_ConsoleConnect"
+LEGACY_TASK_MINUTE = "NetworkRoutine_Reconcile_Minutely"
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 TASK_CREATE_OR_UPDATE = 6
 TASK_LOGON_INTERACTIVE_TOKEN = 3
 TASK_RUNLEVEL_HIGHEST = 1
 TASK_INSTANCES_IGNORE_NEW = 2
 TASK_ACTION_EXEC = 0
-TASK_TRIGGER_TIME = 1
+TASK_TRIGGER_WEEKLY = 3
 TASK_TRIGGER_LOGON = 9
+TASK_TRIGGER_SESSION_STATE_CHANGE = 11
+TASK_SESSION_STATE_CONSOLE_CONNECT = 1
+TASK_SESSION_STATE_UNLOCK = 8
 UTF8_BOM = b"\xef\xbb\xbf"
+ROUTINE_TASKS = [TASK_SCHEDULE, TASK_LOGON, TASK_UNLOCK, TASK_CONSOLE]
+TASKS_TO_DELETE = [LEGACY_TASK_MINUTE, *ROUTINE_TASKS]
+DAY_XML_NAMES = {
+    "mon": "Monday",
+    "tue": "Tuesday",
+    "wed": "Wednesday",
+    "thu": "Thursday",
+    "fri": "Friday",
+    "sat": "Saturday",
+    "sun": "Sunday",
+}
+DAY_BITMASKS = {
+    "sun": 0x01,
+    "mon": 0x02,
+    "tue": 0x04,
+    "wed": 0x08,
+    "thu": 0x10,
+    "fri": 0x20,
+    "sat": 0x40,
+}
 
 DAY_KEYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 DAY_LABELS = {
@@ -71,6 +97,12 @@ DEFAULT_SETTINGS = {
         "dns1": "",
         "dns2": "",
     },
+    "last_handled_segment_id": "",
+    "last_handled_mode": "",
+    "last_handled_at": "",
+    "manual_override_segment_id": "",
+    "manual_override_mode": "",
+    "manual_override_at": "",
     "last_applied_mode": "",
     "last_applied_at": "",
     "last_message": "아직 적용 기록이 없습니다.",
@@ -286,23 +318,98 @@ def parse_time(value: str) -> dt.time:
         raise ValueError("시간은 HH:MM 형식으로 입력해주십시오.") from exc
 
 
-def desired_mode_for(settings: dict, when: dt.datetime | None = None) -> str:
-    when = when or dt.datetime.now()
-    day_key = DAY_KEYS[when.weekday()]
-    day_config = settings["schedule"]["days"][day_key]
+def mode_label(mode: str) -> str:
+    if mode == "internal":
+        return "내부망"
+    if mode == "external":
+        return "외부망"
+    return "-"
 
+
+def internal_interval_for_date(settings: dict, date_value: dt.date) -> tuple[dt.datetime, dt.datetime] | None:
+    day_key = DAY_KEYS[date_value.weekday()]
+    day_config = settings["schedule"]["days"][day_key]
     if not day_config["enabled"]:
-        return "external"
+        return None
 
     start = parse_time(day_config["start"])
     end = parse_time(day_config["end"])
-    current = when.time()
-
     if start == end:
-        return "external"
-    if start < end:
-        return "internal" if start <= current < end else "external"
-    return "internal" if current >= start or current < end else "external"
+        return None
+
+    start_dt = dt.datetime.combine(date_value, start)
+    end_date = date_value if start < end else date_value + dt.timedelta(days=1)
+    end_dt = dt.datetime.combine(end_date, end)
+    return start_dt, end_dt
+
+
+def merged_internal_intervals(
+    settings: dict,
+    center: dt.datetime | None = None,
+    days_before: int = 8,
+    days_after: int = 8,
+) -> list[tuple[dt.datetime, dt.datetime]]:
+    center = center or dt.datetime.now()
+    base_date = center.date()
+    intervals: list[tuple[dt.datetime, dt.datetime]] = []
+
+    for offset in range(-days_before, days_after + 1):
+        interval = internal_interval_for_date(settings, base_date + dt.timedelta(days=offset))
+        if interval is not None:
+            intervals.append(interval)
+
+    intervals.sort(key=lambda item: item[0])
+    merged: list[list[dt.datetime]] = []
+    for start_dt, end_dt in intervals:
+        if not merged or start_dt > merged[-1][1]:
+            merged.append([start_dt, end_dt])
+            continue
+        if end_dt > merged[-1][1]:
+            merged[-1][1] = end_dt
+
+    return [(start_dt, end_dt) for start_dt, end_dt in merged]
+
+
+def current_segment_info(settings: dict, when: dt.datetime | None = None) -> dict:
+    when = when or dt.datetime.now()
+    intervals = merged_internal_intervals(settings, when)
+
+    for start_dt, end_dt in intervals:
+        if start_dt <= when < end_dt:
+            return {
+                "mode": "internal",
+                "segment_id": f"internal|{start_dt.isoformat()}|{end_dt.isoformat()}",
+                "start": start_dt,
+                "end": end_dt,
+            }
+
+    previous_end: dt.datetime | None = None
+    next_start: dt.datetime | None = None
+    for start_dt, end_dt in intervals:
+        if end_dt <= when:
+            previous_end = end_dt
+            continue
+        if start_dt > when:
+            next_start = start_dt
+            break
+
+    if previous_end is None and next_start is None:
+        segment_id = "external|always"
+    else:
+        previous_key = previous_end.isoformat() if previous_end else "past"
+        next_key = next_start.isoformat() if next_start else "future"
+        segment_id = f"external|{previous_key}|{next_key}"
+
+    return {
+        "mode": "external",
+        "segment_id": segment_id,
+        "start": previous_end,
+        "end": next_start,
+    }
+
+
+def desired_mode_for(settings: dict, when: dt.datetime | None = None) -> str:
+    return current_segment_info(settings, when)["mode"]
 
 
 def schedule_summary(settings: dict) -> str:
@@ -396,10 +503,47 @@ def validate_settings(settings: dict) -> None:
         parse_time(day_config["end"])
 
 
-def record_result(settings: dict, mode: str, message: str) -> None:
+def clear_stale_manual_override(settings: dict, current_segment_id: str) -> bool:
+    if settings.get("manual_override_segment_id") == current_segment_id:
+        return False
+    if not settings.get("manual_override_segment_id"):
+        return False
+
+    settings["manual_override_segment_id"] = ""
+    settings["manual_override_mode"] = ""
+    settings["manual_override_at"] = ""
+    return True
+
+
+def record_result(
+    settings: dict,
+    mode: str,
+    message: str,
+    *,
+    segment_info: dict | None = None,
+    mark_handled: bool = False,
+) -> None:
+    current_segment_id = segment_info["segment_id"] if segment_info else ""
+    if current_segment_id:
+        clear_stale_manual_override(settings, current_segment_id)
+
     settings["last_applied_mode"] = mode
     settings["last_applied_at"] = now_text()
     settings["last_message"] = message
+
+    if mark_handled and segment_info is not None:
+        settings["last_handled_segment_id"] = segment_info["segment_id"]
+        settings["last_handled_mode"] = segment_info["mode"]
+        settings["last_handled_at"] = settings["last_applied_at"]
+
+    save_settings(settings)
+
+
+def mark_manual_override(settings: dict, mode: str, when: dt.datetime | None = None) -> None:
+    segment_info = current_segment_info(settings, when)
+    settings["manual_override_segment_id"] = segment_info["segment_id"]
+    settings["manual_override_mode"] = mode
+    settings["manual_override_at"] = now_text()
     save_settings(settings)
 
 
@@ -456,16 +600,23 @@ def mode_matches_current_state(settings: dict, desired_mode: str) -> bool:
     return settings.get("last_applied_mode") == desired_mode
 
 
-def apply_mode(mode: str, settings: dict, reason: str = "") -> str:
+def apply_mode(
+    mode: str,
+    settings: dict,
+    reason: str = "",
+    *,
+    segment_info: dict | None = None,
+    mark_handled: bool = False,
+) -> str:
     adapter = settings["adapter_name"].strip()
     if mode == "internal":
         commands = normalize_internal_commands(adapter, settings["internal"])
         if not commands:
             raise ValueError("내부망으로 바꿀 설정값이 없습니다. IP 또는 DNS를 입력해주십시오.")
-        label = "내부망"
+        label = mode_label("internal")
     elif mode == "external":
         commands = external_commands(adapter)
-        label = "외부망"
+        label = mode_label("external")
     else:
         raise ValueError("알 수 없는 전환 모드입니다.")
 
@@ -474,7 +625,7 @@ def apply_mode(mode: str, settings: dict, reason: str = "") -> str:
 
     suffix = f" ({reason})" if reason else ""
     message = f"{label} 적용 완료{suffix}"
-    record_result(settings, mode, message)
+    record_result(settings, mode, message, segment_info=segment_info, mark_handled=mark_handled)
     logging.info(message)
     return message
 
@@ -483,12 +634,37 @@ def reconcile_now(settings: dict) -> str:
     if not settings.get("automation_enabled"):
         return "자동 루틴이 꺼져 있어 검사만 생략했습니다."
 
-    desired = desired_mode_for(settings)
+    segment_info = current_segment_info(settings)
+    desired = segment_info["mode"]
+    current_segment_id = segment_info["segment_id"]
+    clear_stale_manual_override(settings, current_segment_id)
+
+    if settings.get("manual_override_segment_id") == current_segment_id:
+        manual_mode = settings.get("manual_override_mode") or desired
+        message = f"수동 전환 유지: {mode_label(manual_mode)}"
+        settings["last_message"] = message
+        save_settings(settings)
+        return message
+
+    if settings.get("last_handled_segment_id") == current_segment_id:
+        return f"이미 처리한 시간대 유지: {mode_label(desired)}"
+
     if mode_matches_current_state(settings, desired):
-        if settings.get("last_applied_mode") != desired:
-            record_result(settings, desired, f"현재 상태 확인: {'내부망' if desired == 'internal' else '외부망'}")
-        return f"현재 시간 기준 유지: {'내부망' if desired == 'internal' else '외부망'}"
-    return apply_mode(desired, settings, reason="자동 루틴")
+        record_result(
+            settings,
+            desired,
+            f"현재 상태 확인: {mode_label(desired)}",
+            segment_info=segment_info,
+            mark_handled=True,
+        )
+        return f"현재 상태 확인: {mode_label(desired)}"
+    return apply_mode(
+        desired,
+        settings,
+        reason="자동 루틴",
+        segment_info=segment_info,
+        mark_handled=True,
+    )
 
 
 def build_task_runner_action(extra_args: list[str]) -> tuple[str, str]:
@@ -543,16 +719,6 @@ def delete_task(task_name: str) -> None:
             logging.info("작업 삭제: %s", task_name)
 
 
-def create_time_trigger(task_definition, when: dt.datetime):
-    trigger = task_definition.Triggers.Create(TASK_TRIGGER_TIME)
-    trigger.StartBoundary = when.strftime("%Y-%m-%dT%H:%M:%S")
-    trigger.Enabled = True
-    trigger.Repetition.Interval = "PT1M"
-    trigger.Repetition.Duration = "P3650D"
-    trigger.Repetition.StopAtDurationEnd = False
-    return trigger
-
-
 def create_logon_trigger(task_definition, user_id: str):
     trigger = task_definition.Triggers.Create(TASK_TRIGGER_LOGON)
     trigger.Enabled = True
@@ -560,11 +726,93 @@ def create_logon_trigger(task_definition, user_id: str):
     return trigger
 
 
-def create_task_via_com(task_name: str, trigger_kind: str, command: str, arguments: str) -> None:
-    service = task_service()
-    root = service.GetFolder("\\")
-    task_definition = service.NewTask(0)
+def create_session_trigger(task_definition, user_id: str, state_change: int):
+    trigger = task_definition.Triggers.Create(TASK_TRIGGER_SESSION_STATE_CHANGE)
+    trigger.Enabled = True
+    trigger.UserId = user_id
+    trigger.StateChange = state_change
+    return trigger
 
+
+def next_weekly_boundary(day_key: str, time_value: dt.time, now: dt.datetime | None = None) -> dt.datetime:
+    now = now or dt.datetime.now()
+    target_weekday = DAY_KEYS.index(day_key)
+    days_ahead = (target_weekday - now.weekday()) % 7
+    candidate_date = now.date() + dt.timedelta(days=days_ahead)
+    candidate = dt.datetime.combine(candidate_date, time_value)
+    if candidate <= now:
+        candidate += dt.timedelta(days=7)
+    return candidate
+
+
+def build_schedule_trigger_specs(settings: dict) -> list[dict]:
+    specs: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+
+    for day_index, day_key in enumerate(DAY_KEYS):
+        day_config = settings["schedule"]["days"][day_key]
+        if not day_config["enabled"]:
+            continue
+
+        start = parse_time(day_config["start"])
+        end = parse_time(day_config["end"])
+        if start == end:
+            continue
+
+        start_spec = (day_key, start.strftime("%H:%M"))
+        if start_spec not in seen:
+            seen.add(start_spec)
+            specs.append({"day_key": day_key, "time": start})
+
+        end_day_key = DAY_KEYS[(day_index + (0 if start < end else 1)) % 7]
+        end_spec = (end_day_key, end.strftime("%H:%M"))
+        if end_spec not in seen:
+            seen.add(end_spec)
+            specs.append({"day_key": end_day_key, "time": end})
+
+    return specs
+
+
+def create_weekly_trigger(task_definition, day_key: str, time_value: dt.time):
+    trigger = task_definition.Triggers.Create(TASK_TRIGGER_WEEKLY)
+    trigger.StartBoundary = next_weekly_boundary(day_key, time_value).strftime("%Y-%m-%dT%H:%M:%S")
+    trigger.Enabled = True
+    trigger.WeeksInterval = 1
+    trigger.DaysOfWeek = DAY_BITMASKS[day_key]
+    return trigger
+
+
+def session_trigger_xml(trigger_kind: str, user_id_xml: str) -> str:
+    if trigger_kind == "unlock":
+        state_change = "SessionUnlock"
+    elif trigger_kind == "console":
+        state_change = "ConsoleConnect"
+    else:
+        raise ValueError("알 수 없는 세션 상태 트리거입니다.")
+
+    return f"""    <SessionStateChangeTrigger>
+      <Enabled>true</Enabled>
+      <UserId>{user_id_xml}</UserId>
+      <StateChange>{state_change}</StateChange>
+    </SessionStateChangeTrigger>"""
+
+
+def weekly_trigger_xml(day_key: str, time_value: dt.time) -> str:
+    start_boundary = next_weekly_boundary(day_key, time_value).strftime("%Y-%m-%dT%H:%M:%S")
+    day_xml_name = DAY_XML_NAMES[day_key]
+    return f"""    <CalendarTrigger>
+      <StartBoundary>{start_boundary}</StartBoundary>
+      <Enabled>true</Enabled>
+      <ScheduleByWeek>
+        <WeeksInterval>1</WeeksInterval>
+        <DaysOfWeek>
+          <{day_xml_name}/>
+        </DaysOfWeek>
+      </ScheduleByWeek>
+    </CalendarTrigger>"""
+
+
+def configure_task_definition(task_definition, user_id: str) -> None:
     settings = task_definition.Settings
     settings.Enabled = True
     settings.StartWhenAvailable = True
@@ -576,24 +824,37 @@ def create_task_via_com(task_name: str, trigger_kind: str, command: str, argumen
     settings.ExecutionTimeLimit = "PT72H"
     settings.MultipleInstances = TASK_INSTANCES_IGNORE_NEW
 
-    user_id, _ = current_identity()
     principal = task_definition.Principal
     principal.UserId = user_id
     principal.LogonType = TASK_LOGON_INTERACTIVE_TOKEN
     principal.RunLevel = TASK_RUNLEVEL_HIGHEST
 
-    if trigger_kind == "minute":
-        next_start = (dt.datetime.now() + dt.timedelta(minutes=1)).replace(second=0, microsecond=0)
-        create_time_trigger(task_definition, next_start)
-    elif trigger_kind == "logon":
-        create_logon_trigger(task_definition, user_id)
-    else:
-        raise ValueError("알 수 없는 작업 트리거입니다.")
 
+def configure_task_action(task_definition, command: str, arguments: str) -> None:
     action = task_definition.Actions.Create(TASK_ACTION_EXEC)
     action.Path = command
     action.Arguments = arguments
     action.WorkingDirectory = str(app_dir())
+
+
+def create_task_via_com(task_name: str, trigger_kind: str, command: str, arguments: str) -> None:
+    service = task_service()
+    root = service.GetFolder("\\")
+    task_definition = service.NewTask(0)
+
+    user_id, _ = current_identity()
+    configure_task_definition(task_definition, user_id)
+
+    if trigger_kind == "logon":
+        create_logon_trigger(task_definition, user_id)
+    elif trigger_kind == "unlock":
+        create_session_trigger(task_definition, user_id, TASK_SESSION_STATE_UNLOCK)
+    elif trigger_kind == "console":
+        create_session_trigger(task_definition, user_id, TASK_SESSION_STATE_CONSOLE_CONNECT)
+    else:
+        raise ValueError("알 수 없는 작업 트리거입니다.")
+
+    configure_task_action(task_definition, command, arguments)
 
     root.RegisterTaskDefinition(
         task_name,
@@ -606,7 +867,35 @@ def create_task_via_com(task_name: str, trigger_kind: str, command: str, argumen
     logging.info("작업 등록: %s", task_name)
 
 
-def build_task_xml_content(task_name: str, trigger_kind: str, command: str, arguments: str) -> str:
+def create_schedule_task_via_com(task_name: str, settings: dict, command: str, arguments: str) -> None:
+    service = task_service()
+    root = service.GetFolder("\\")
+    task_definition = service.NewTask(0)
+
+    user_id, _ = current_identity()
+    configure_task_definition(task_definition, user_id)
+
+    trigger_specs = build_schedule_trigger_specs(settings)
+    if not trigger_specs:
+        raise ValueError("등록할 자동 경계 시간이 없습니다.")
+
+    for spec in trigger_specs:
+        create_weekly_trigger(task_definition, spec["day_key"], spec["time"])
+
+    configure_task_action(task_definition, command, arguments)
+
+    root.RegisterTaskDefinition(
+        task_name,
+        task_definition,
+        TASK_CREATE_OR_UPDATE,
+        "",
+        "",
+        TASK_LOGON_INTERACTIVE_TOKEN,
+    )
+    logging.info("작업 등록(일정): %s", task_name)
+
+
+def build_task_xml_document(task_name: str, trigger_blocks: list[str], command: str, arguments: str) -> str:
     user_id, _ = current_identity()
     working_directory = str(app_dir())
     author = html.escape(user_id)
@@ -615,25 +904,6 @@ def build_task_xml_content(task_name: str, trigger_kind: str, command: str, argu
     working_dir_xml = html.escape(working_directory)
     user_id_xml = html.escape(user_id)
 
-    if trigger_kind == "minute":
-        next_start = (dt.datetime.now() + dt.timedelta(minutes=1)).replace(second=0, microsecond=0)
-        trigger_xml = f"""    <TimeTrigger>
-      <Repetition>
-        <Interval>PT1M</Interval>
-        <Duration>P3650D</Duration>
-        <StopAtDurationEnd>false</StopAtDurationEnd>
-      </Repetition>
-      <StartBoundary>{next_start.strftime("%Y-%m-%dT%H:%M:%S")}</StartBoundary>
-      <Enabled>true</Enabled>
-    </TimeTrigger>"""
-    elif trigger_kind == "logon":
-        trigger_xml = f"""    <LogonTrigger>
-      <Enabled>true</Enabled>
-      <UserId>{user_id_xml}</UserId>
-    </LogonTrigger>"""
-    else:
-        raise ValueError("알 수 없는 작업 트리거입니다.")
-
     return f"""<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
@@ -641,7 +911,7 @@ def build_task_xml_content(task_name: str, trigger_kind: str, command: str, argu
     <URI>\\{html.escape(task_name)}</URI>
   </RegistrationInfo>
   <Triggers>
-{trigger_xml}
+{chr(10).join(trigger_blocks)}
   </Triggers>
   <Principals>
     <Principal id="Author">
@@ -680,6 +950,30 @@ def build_task_xml_content(task_name: str, trigger_kind: str, command: str, argu
 """
 
 
+def build_task_xml_content(task_name: str, trigger_kind: str, command: str, arguments: str) -> str:
+    user_id, _ = current_identity()
+    user_id_xml = html.escape(user_id)
+
+    if trigger_kind == "logon":
+        trigger_block = f"""    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>{user_id_xml}</UserId>
+    </LogonTrigger>"""
+    elif trigger_kind in {"unlock", "console"}:
+        trigger_block = session_trigger_xml(trigger_kind, user_id_xml)
+    else:
+        raise ValueError("알 수 없는 작업 트리거입니다.")
+
+    return build_task_xml_document(task_name, [trigger_block], command, arguments)
+
+
+def build_schedule_task_xml_content(task_name: str, settings: dict, command: str, arguments: str) -> str:
+    trigger_blocks = [weekly_trigger_xml(spec["day_key"], spec["time"]) for spec in build_schedule_trigger_specs(settings)]
+    if not trigger_blocks:
+        raise ValueError("등록할 자동 경계 시간이 없습니다.")
+    return build_task_xml_document(task_name, trigger_blocks, command, arguments)
+
+
 def create_task_via_xml(task_name: str, trigger_kind: str, command: str, arguments: str) -> None:
     xml_content = build_task_xml_content(task_name, trigger_kind, command, arguments)
     temp_path: str | None = None
@@ -702,15 +996,34 @@ def create_task_via_xml(task_name: str, trigger_kind: str, command: str, argumen
                 logging.exception("임시 XML 삭제 실패: %s", temp_path)
 
 
+def create_schedule_task_via_xml(task_name: str, settings: dict, command: str, arguments: str) -> None:
+    xml_content = build_schedule_task_xml_content(task_name, settings, command, arguments)
+    temp_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-16",
+            suffix=".xml",
+            delete=False,
+        ) as file:
+            file.write(xml_content)
+            temp_path = file.name
+        run_command(["schtasks", "/Create", "/TN", task_name, "/XML", temp_path, "/F"], check=True)
+        logging.info("작업 등록(XML 일정): %s", task_name)
+    finally:
+        if temp_path:
+            try:
+                Path(temp_path).unlink(missing_ok=True)
+            except Exception:
+                logging.exception("임시 XML 삭제 실패: %s", temp_path)
+
+
 def create_task_via_schtasks(task_name: str, trigger_kind: str, command: str, arguments: str) -> None:
     task_run = f"{subprocess.list2cmdline([command])} {arguments}".strip()
-    if trigger_kind == "minute":
-        next_minute = (dt.datetime.now() + dt.timedelta(minutes=1)).strftime("%H:%M")
-        schedule_args = ["/SC", "MINUTE", "/MO", "1", "/ST", next_minute]
-    elif trigger_kind == "logon":
+    if trigger_kind == "logon":
         schedule_args = ["/SC", "ONLOGON"]
     else:
-        raise ValueError("알 수 없는 작업 트리거입니다.")
+        raise RuntimeError("세션 상태 트리거는 schtasks 직접 등록이 지원되지 않습니다.")
 
     run_command(
         ["schtasks", "/Create", "/TN", task_name, *schedule_args, "/TR", task_run, "/RL", "HIGHEST", "/F"],
@@ -735,16 +1048,37 @@ def create_task(task_name: str, trigger_kind: str, command: str, arguments: str)
     create_task_via_schtasks(task_name, trigger_kind, command, arguments)
 
 
+def create_schedule_task(task_name: str, settings: dict, command: str, arguments: str) -> None:
+    if not build_schedule_trigger_specs(settings):
+        logging.info("등록할 자동 경계 시간이 없어 정시 작업은 만들지 않습니다: %s", task_name)
+        return
+
+    try:
+        create_schedule_task_via_com(task_name, settings, command, arguments)
+        return
+    except Exception:
+        logging.exception("COM 일정 작업 등록 실패, XML 등록 시도: %s", task_name)
+
+    try:
+        create_schedule_task_via_xml(task_name, settings, command, arguments)
+        return
+    except Exception as exc:
+        logging.exception("XML 일정 작업 등록 실패: %s", task_name)
+        raise RuntimeError(f"자동 경계 시간 작업 등록에 실패했습니다: {exc}") from exc
+
+
 def sync_tasks(settings: dict) -> None:
-    delete_task(TASK_MINUTE)
-    delete_task(TASK_LOGON)
+    for task_name in TASKS_TO_DELETE:
+        delete_task(task_name)
 
     if not settings.get("automation_enabled"):
         return
 
     command, arguments = build_task_runner_action(["--reconcile"])
-    create_task(TASK_MINUTE, "minute", command, arguments)
+    create_schedule_task(TASK_SCHEDULE, settings, command, arguments)
     create_task(TASK_LOGON, "logon", command, arguments)
+    create_task(TASK_UNLOCK, "unlock", command, arguments)
+    create_task(TASK_CONSOLE, "console", command, arguments)
 
 
 def parse_list_fields(output: str) -> dict[str, str]:
@@ -837,6 +1171,7 @@ class NetworkRoutineApp:
         self.root.geometry("900x540")
         self.root.minsize(840, 500)
         self.refresh_job: str | None = None
+        self.startup_reconcile_job: str | None = None
 
         self.settings = load_settings()
         self.adapter_choices = list_adapters()
@@ -868,6 +1203,7 @@ class NetworkRoutineApp:
 
         self.build_ui()
         self.refresh_runtime_labels()
+        self.schedule_startup_reconcile()
         self.schedule_refresh()
 
     def build_ui(self) -> None:
@@ -914,7 +1250,7 @@ class NetworkRoutineApp:
 
         ttk.Label(
             top,
-            text="자동 루틴이 켜져 있으면 1분마다 현재 시간표를 다시 확인합니다.",
+            text="자동 루틴은 출근/퇴근 경계 시각과 로그인·복귀 시점에만 자동 처리합니다.",
         ).grid(row=3, column=0, columnspan=3, padx=6, pady=(0, 6), sticky="w")
 
         compact_fields = [
@@ -981,7 +1317,7 @@ class NetworkRoutineApp:
 
         bottom = ttk.Frame(outer)
         bottom.pack(fill="x", pady=(0, 8))
-        ttk.Label(bottom, text="자동 루틴이 켜져 있으면 수동 전환 후에도 다음 검사 때 시간표 기준으로 다시 맞춥니다.").pack(
+        ttk.Label(bottom, text="수동 전환하면 현재 시간대에는 자동이 다시 덮어쓰지 않습니다.").pack(
             side="left"
         )
         ttk.Button(bottom, text="창 닫기", command=self.root.destroy).pack(side="right")
@@ -999,6 +1335,36 @@ class NetworkRoutineApp:
         ttk.Label(status, textvariable=self.status_var, wraplength=840, justify="left").pack(
             fill="x", padx=8, pady=(0, 8)
         )
+
+    def schedule_startup_reconcile(self) -> None:
+        if self.startup_reconcile_job:
+            self.root.after_cancel(self.startup_reconcile_job)
+        self.startup_reconcile_job = self.root.after(700, self._run_startup_reconcile)
+
+    def _run_startup_reconcile(self) -> None:
+        self.startup_reconcile_job = None
+        self.run_background_reconcile_if_enabled("시작 시 확인", update_status_on_noop=True)
+
+    def run_background_reconcile_if_enabled(self, source: str, update_status_on_noop: bool = False) -> None:
+        try:
+            saved = load_settings()
+            validate_settings(saved)
+            self.settings = saved
+
+            if not saved.get("automation_enabled"):
+                self.refresh_runtime_labels()
+                return
+
+            message = reconcile_now(saved)
+            self.settings = load_settings()
+            self.refresh_runtime_labels()
+
+            is_noop = message.startswith("현재 시간 기준 유지:")
+            if update_status_on_noop or not is_noop:
+                self.set_status(f"{source}: {message}")
+        except Exception as exc:
+            logging.exception("%s 실패", source)
+            self.set_status(f"{source} 실패: {exc}")
 
     def all_adapter_values(self) -> list[str]:
         values = list(self.adapter_choices)
@@ -1054,12 +1420,19 @@ class NetworkRoutineApp:
     def persist_settings(self, sync_schedule_enabled: bool = True) -> dict:
         previous = load_settings()
         updated = self.collect_form_settings()
-        if previous["adapter_name"] != updated["adapter_name"]:
+        state_related_changed = (
+            previous["adapter_name"] != updated["adapter_name"]
+            or previous["internal"] != updated["internal"]
+            or previous["schedule"] != updated["schedule"]
+        )
+        if state_related_changed:
             updated["last_applied_mode"] = ""
-        if previous["internal"] != updated["internal"]:
-            updated["last_applied_mode"] = ""
-        if previous["schedule"] != updated["schedule"]:
-            updated["last_applied_mode"] = ""
+            updated["last_handled_segment_id"] = ""
+            updated["last_handled_mode"] = ""
+            updated["last_handled_at"] = ""
+            updated["manual_override_segment_id"] = ""
+            updated["manual_override_mode"] = ""
+            updated["manual_override_at"] = ""
 
         save_settings(updated)
         self.settings = updated
@@ -1071,6 +1444,7 @@ class NetworkRoutineApp:
         try:
             settings = self.persist_settings(sync_schedule_enabled=True)
             message = apply_mode(mode, settings, reason="수동 전환")
+            mark_manual_override(settings, mode)
             self.settings = load_settings()
             self.refresh_runtime_labels()
             self.set_status(message)
@@ -1094,14 +1468,22 @@ class NetworkRoutineApp:
     def current_runtime_text(self) -> str:
         try:
             preview = self.collect_form_settings()
-            current_target = desired_mode_for(preview)
-            current_label = "내부망" if current_target == "internal" else "외부망"
+            segment_info = current_segment_info(preview)
+            current_target = segment_info["mode"]
+            current_label = mode_label(current_target)
             summary = schedule_summary(preview)
+            if preview.get("manual_override_segment_id") == segment_info["segment_id"]:
+                control_text = f"수동 우선 {mode_label(preview.get('manual_override_mode') or current_target)}"
+            elif preview.get("last_handled_segment_id") == segment_info["segment_id"]:
+                control_text = f"현재 시간대 자동 처리 완료 {current_label}"
+            else:
+                control_text = f"현재 시간대 자동 처리 대기 {current_label}"
             return (
                 f"예상 모드: {current_label} | "
                 f"자동 루틴: {'켜짐' if preview['automation_enabled'] else '꺼짐'} | "
                 f"어댑터: {preview['adapter_name'] or '-'} | "
-                f"시간표: {summary}"
+                f"시간표: {summary} | "
+                f"제어: {control_text}"
             )
         except Exception as exc:
             return f"입력값 확인 필요: {exc}"
@@ -1140,8 +1522,10 @@ class NetworkRoutineApp:
         )
 
     def current_task_text(self) -> str:
-        minute = inspect_task(TASK_MINUTE)
+        schedule = inspect_task(TASK_SCHEDULE)
         logon = inspect_task(TASK_LOGON)
+        unlock = inspect_task(TASK_UNLOCK)
+        console = inspect_task(TASK_CONSOLE)
 
         def format_task(prefix: str, info: dict) -> str:
             if not info["exists"]:
@@ -1155,7 +1539,27 @@ class NetworkRoutineApp:
                 f"{prefix}: 등록됨/{state}/결과 {result}/대상 {target}/배터리 {battery}/다음 {next_run}"
             )
 
-        return f"작업 상태 | {format_task('분', minute)} | {format_task('로그온', logon)}"
+        def format_resume_task() -> str:
+            infos = [("잠금해제", unlock), ("콘솔", console)]
+            existing = [(label, info) for label, info in infos if info["exists"]]
+            if not existing:
+                return "복귀: 미등록"
+
+            states = ",".join(f"{label} {info.get('state') or '-'}" for label, info in existing)
+            results = ",".join(f"{label} {info.get('last_result') or '-'}" for label, info in existing)
+            targets = {info.get("target_type") or "-" for _, info in existing}
+            batteries = {info.get("battery_status") or "-" for _, info in existing}
+            target_text = next(iter(targets)) if len(targets) == 1 else "혼합"
+            battery_text = next(iter(batteries)) if len(batteries) == 1 else "혼합"
+            return (
+                f"복귀: {len(existing)}/{len(infos)} 등록/상태 {states}/결과 {results}/"
+                f"대상 {target_text}/배터리 {battery_text}"
+            )
+
+        return (
+            f"작업 상태 | {format_task('정시', schedule)} | "
+            f"{format_task('로그온', logon)} | {format_resume_task()}"
+        )
 
     def show_error(self, exc: Exception) -> None:
         logging.exception("오류 발생")

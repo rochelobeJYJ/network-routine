@@ -7,8 +7,10 @@ Windows에서 내부망/외부망 전환을 간단한 GUI로 처리하는 프로
 - 내부망 IP/DNS를 GUI에서 입력하고 저장합니다.
 - 외부망은 DHCP 자동 설정으로 전환합니다.
 - 출근/퇴근 시간을 요일별로 지정할 수 있습니다.
-- 자동 루틴을 켜면 작업 스케줄러에 등록되어 1분마다 상태를 맞춥니다.
-- 로그인 직후에도 한 번 더 현재 시간 기준으로 상태를 맞춥니다.
+- 자동 루틴을 켜면 출근/퇴근 경계 시각에만 자동 전환을 시도합니다.
+- 로그인, 잠금 해제, 절전 복귀 계열 시점에도 현재 시간대 기준으로 한 번 더 보정합니다.
+- 같은 시간대에서 자동 전환은 한 번만 처리합니다.
+- 수동 전환하면 현재 시간대에서는 자동이 다시 덮어쓰지 않습니다.
 - 배터리 사용 중에도 자동 루틴은 계속 동작합니다.
 - 수동 전환 버튼으로 언제든 즉시 변경할 수 있습니다.
 
@@ -37,21 +39,25 @@ Windows에서 내부망/외부망 전환을 간단한 GUI로 처리하는 프로
 
 ## 등록 확인
 
-자동 루틴을 켠 뒤 아래 두 작업이 등록되어 있어야 합니다.
+자동 루틴을 켠 뒤 아래 작업들이 등록되어 있어야 합니다.
 
-- `NetworkRoutine_Reconcile_Minutely`
+- `NetworkRoutine_Reconcile_Schedule`
 - `NetworkRoutine_Reconcile_Logon`
+- `NetworkRoutine_Reconcile_Unlock`
+- `NetworkRoutine_Reconcile_ConsoleConnect`
 
 확인 명령:
 
 ```powershell
-schtasks /Query /TN "NetworkRoutine_Reconcile_Minutely" /V /FO LIST
+schtasks /Query /TN "NetworkRoutine_Reconcile_Schedule" /V /FO LIST
 schtasks /Query /TN "NetworkRoutine_Reconcile_Logon" /V /FO LIST
+schtasks /Query /TN "NetworkRoutine_Reconcile_Unlock" /V /FO LIST
+schtasks /Query /TN "NetworkRoutine_Reconcile_ConsoleConnect" /V /FO LIST
 ```
 
 정상 기준:
 
-- 분 작업: `마지막 결과: 0`
+- 정시 작업: `마지막 결과: 0`
 - 로그온 작업: 첫 로그인 전에는 `267011 (0x41303)`일 수 있음
 - `실행할 작업`은 `NetworkRoutine.exe --reconcile` 이어야 함
 - `전원 관리:`는 비어 있거나 배터리 제한이 없어야 함
