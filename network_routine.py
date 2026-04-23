@@ -250,7 +250,9 @@ def run_command(command: list[str], check: bool = True) -> subprocess.CompletedP
         check=False,
     )
     if check and result.returncode != 0:
-        message = (result.stderr or result.stdout or "").strip() or "알 수 없는 오류"
+        output = (result.stderr or result.stdout or "").strip()
+        command_text = subprocess.list2cmdline(command)
+        message = output or f"명령이 실패했습니다. 종료 코드: {result.returncode}, 명령: {command_text}"
         raise RuntimeError(message)
     return result
 
@@ -453,24 +455,28 @@ def normalize_internal_commands(adapter: str, internal: dict) -> list[list[str]]
         commands.append(
             [
                 "netsh",
-                "dnsclient",
+                "interface",
+                "ipv4",
                 "set",
                 "dnsservers",
                 adapter_arg,
                 "source=static",
                 f"address={dns_values[0]}",
+                "validate=no",
             ]
         )
         for index, value in enumerate(dns_values[1:], start=2):
             commands.append(
                 [
                     "netsh",
-                    "dnsclient",
+                    "interface",
+                    "ipv4",
                     "add",
                     "dnsservers",
                     adapter_arg,
                     f"index={index}",
                     f"address={value}",
+                    "validate=no",
                 ]
             )
 
@@ -481,7 +487,7 @@ def external_commands(adapter: str) -> list[list[str]]:
     adapter_arg = f'name="{adapter}"'
     return [
         ["netsh", "interface", "ipv4", "set", "address", adapter_arg, "source=dhcp"],
-        ["netsh", "dnsclient", "set", "dnsservers", adapter_arg, "source=dhcp"],
+        ["netsh", "interface", "ipv4", "set", "dnsservers", adapter_arg, "source=dhcp"],
     ]
 
 
@@ -1442,7 +1448,7 @@ class NetworkRoutineApp:
 
     def manual_apply(self, mode: str) -> None:
         try:
-            settings = self.persist_settings(sync_schedule_enabled=True)
+            settings = self.persist_settings(sync_schedule_enabled=False)
             message = apply_mode(mode, settings, reason="수동 전환")
             mark_manual_override(settings, mode)
             self.settings = load_settings()

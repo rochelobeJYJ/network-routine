@@ -1,5 +1,20 @@
 # Release Notes
 
+## v1.1.2
+
+수동 전환 오류를 수정한 버전입니다.
+
+### 변경 사항
+
+- DNS 변경 명령을 Windows에서 지원되는 `netsh interface ipv4 set/add dnsservers` 형식으로 수정
+- DNS 서버 설정 시 검증 지연으로 실패하지 않도록 `validate=no` 적용
+- 수동 전환 시 작업 스케줄러 재등록을 수행하지 않도록 분리
+- `알 수 없는 오류` 대신 실패한 명령과 종료 코드를 표시하도록 개선
+
+### 배포 파일
+
+- `NetworkRoutine.exe`
+
 ## v1.1.1
 
 배포 문서와 GitHub 릴리즈 정리를 반영한 버전입니다.
