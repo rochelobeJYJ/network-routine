@@ -7,6 +7,7 @@ import datetime as dt
 import html
 import ipaddress
 import json
+import locale
 import logging
 import os
 from pathlib import Path
@@ -246,14 +247,39 @@ def ensure_admin() -> None:
         relaunch_as_admin()
 
 
+def decode_command_output(data: bytes | None) -> str:
+    if not data:
+        return ""
+
+    encodings = ["utf-8", "cp949", locale.getpreferredencoding(False)]
+    seen: set[str] = set()
+    for encoding in encodings:
+        normalized = (encoding or "").strip().lower()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+
+    return data.decode("utf-8", errors="replace")
+
+
 def run_command(command: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
     logging.info("실행: %s", command)
-    result = subprocess.run(
+    raw_result = subprocess.run(
         command,
         capture_output=True,
-        text=True,
+        text=False,
         creationflags=CREATE_NO_WINDOW,
         check=False,
+    )
+    result = subprocess.CompletedProcess(
+        raw_result.args,
+        raw_result.returncode,
+        decode_command_output(raw_result.stdout),
+        decode_command_output(raw_result.stderr),
     )
     if check and result.returncode != 0:
         output = (result.stderr or result.stdout or "").strip()
@@ -454,7 +480,7 @@ def read_current_wifi_name(adapter: str) -> str:
         return ""
 
     current_interface = ""
-    for raw_line in result.stdout.splitlines():
+    for raw_line in (result.stdout or "").splitlines():
         if ":" not in raw_line:
             continue
         key, value = raw_line.split(":", 1)
@@ -1299,8 +1325,8 @@ class NetworkRoutineApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("900x620")
-        self.root.minsize(840, 580)
+        self.root.geometry("1040x640")
+        self.root.minsize(960, 600)
         self.refresh_job: str | None = None
         self.startup_reconcile_job: str | None = None
 
@@ -1346,8 +1372,8 @@ class NetworkRoutineApp:
 
         top_row = ttk.Frame(outer)
         top_row.pack(fill="x", pady=(0, 8))
-        top_row.columnconfigure(0, weight=3)
-        top_row.columnconfigure(1, weight=4)
+        top_row.columnconfigure(0, weight=4)
+        top_row.columnconfigure(1, weight=6)
 
         top = ttk.LabelFrame(top_row, text="실행")
         top.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
@@ -1361,7 +1387,7 @@ class NetworkRoutineApp:
             textvariable=self.adapter_var,
             state="readonly",
             values=self.all_adapter_values(),
-            width=22,
+            width=24,
         )
         self.adapter_combo.grid(row=0, column=1, padx=6, pady=6, sticky="ew")
         ttk.Button(top, text="새로고침", command=self.refresh_adapters).grid(
@@ -1376,7 +1402,7 @@ class NetworkRoutineApp:
         ttk.Checkbutton(top, text="회사 Wi-Fi 이름 우선", variable=self.company_wifi_enabled_var).grid(
             row=2, column=0, padx=6, pady=(0, 4), sticky="w"
         )
-        ttk.Entry(top, textvariable=self.company_wifi_names_var, width=28).grid(
+        ttk.Entry(top, textvariable=self.company_wifi_names_var, width=34).grid(
             row=2, column=1, padx=6, pady=(0, 4), sticky="ew"
         )
         ttk.Label(top, text="여러 개면 쉼표로 구분").grid(
@@ -1394,8 +1420,10 @@ class NetworkRoutineApp:
 
         ttk.Label(
             top,
-            text="자동 루틴은 회사 Wi-Fi 이름 또는 시간표 기준으로 경계 시각, 로그인·복귀, Wi-Fi 연결 변경 시점에만 자동 처리합니다.",
-        ).grid(row=4, column=0, columnspan=3, padx=6, pady=(0, 6), sticky="w")
+            text="자동 루틴은 회사 Wi-Fi 이름 또는 시간표 기준으로 경계 시각, 로그인·복귀, Wi-Fi 연결 변경 때만 자동 처리합니다.",
+            wraplength=420,
+            justify="left",
+        ).grid(row=4, column=0, columnspan=3, padx=6, pady=(0, 6), sticky="ew")
 
         compact_fields = [
             ("IP", self.ip_var, 0, 0),
@@ -1406,14 +1434,14 @@ class NetworkRoutineApp:
         ]
         for label, variable, row, column in compact_fields:
             ttk.Label(net_frame, text=label).grid(row=row, column=column, padx=6, pady=6, sticky="w")
-            ttk.Entry(net_frame, textvariable=variable, width=18).grid(
+            ttk.Entry(net_frame, textvariable=variable, width=20).grid(
                 row=row, column=column + 1, padx=(0, 8), pady=6, sticky="ew"
             )
         ttk.Label(net_frame, text="비워두면 해당 값은 변경하지 않습니다.").grid(
             row=2, column=2, columnspan=2, padx=6, pady=6, sticky="w"
         )
-        net_frame.columnconfigure(1, weight=1)
-        net_frame.columnconfigure(3, weight=1)
+        net_frame.columnconfigure(1, weight=1, minsize=190)
+        net_frame.columnconfigure(3, weight=1, minsize=190)
 
         schedule = ttk.LabelFrame(outer, text="근무 시간")
         schedule.pack(fill="x", pady=(0, 8))
@@ -1470,13 +1498,13 @@ class NetworkRoutineApp:
         status = ttk.LabelFrame(outer, text="상태")
         status.pack(fill="x")
 
-        ttk.Label(status, textvariable=self.runtime_var, wraplength=840, justify="left").pack(
+        ttk.Label(status, textvariable=self.runtime_var, wraplength=980, justify="left").pack(
             fill="x", padx=8, pady=(8, 4)
         )
-        ttk.Label(status, textvariable=self.task_var, wraplength=840, justify="left").pack(
+        ttk.Label(status, textvariable=self.task_var, wraplength=980, justify="left").pack(
             fill="x", padx=8, pady=(0, 4)
         )
-        ttk.Label(status, textvariable=self.status_var, wraplength=840, justify="left").pack(
+        ttk.Label(status, textvariable=self.status_var, wraplength=980, justify="left").pack(
             fill="x", padx=8, pady=(0, 8)
         )
 
