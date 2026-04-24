@@ -10,6 +10,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -29,6 +30,7 @@ TASK_SCHEDULE = "NetworkRoutine_Reconcile_Schedule"
 TASK_LOGON = "NetworkRoutine_Reconcile_Logon"
 TASK_UNLOCK = "NetworkRoutine_Reconcile_Unlock"
 TASK_CONSOLE = "NetworkRoutine_Reconcile_ConsoleConnect"
+TASK_WIFI_EVENT = "NetworkRoutine_Reconcile_WifiChange"
 LEGACY_TASK_MINUTE = "NetworkRoutine_Reconcile_Minutely"
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 TASK_CREATE_OR_UPDATE = 6
@@ -42,7 +44,7 @@ TASK_TRIGGER_SESSION_STATE_CHANGE = 11
 TASK_SESSION_STATE_CONSOLE_CONNECT = 1
 TASK_SESSION_STATE_UNLOCK = 8
 UTF8_BOM = b"\xef\xbb\xbf"
-ROUTINE_TASKS = [TASK_SCHEDULE, TASK_LOGON, TASK_UNLOCK, TASK_CONSOLE]
+ROUTINE_TASKS = [TASK_SCHEDULE, TASK_LOGON, TASK_UNLOCK, TASK_CONSOLE, TASK_WIFI_EVENT]
 TASKS_TO_DELETE = [LEGACY_TASK_MINUTE, *ROUTINE_TASKS]
 DAY_XML_NAMES = {
     "mon": "Monday",
@@ -96,6 +98,10 @@ DEFAULT_SETTINGS = {
         "gateway": "",
         "dns1": "",
         "dns2": "",
+    },
+    "company_wifi": {
+        "enabled": False,
+        "names": [],
     },
     "last_handled_segment_id": "",
     "last_handled_mode": "",
@@ -320,6 +326,31 @@ def parse_time(value: str) -> dt.time:
         raise ValueError("시간은 HH:MM 형식으로 입력해주십시오.") from exc
 
 
+def parse_company_wifi_names(value: object) -> list[str]:
+    raw_items: list[str]
+    if isinstance(value, list):
+        raw_items = [str(item) for item in value]
+    elif isinstance(value, str):
+        raw_items = re.split(r"[,;\r\n]+", value)
+    else:
+        raw_items = [str(value)] if value is not None else []
+
+    names: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        name = item.strip()
+        key = name.casefold()
+        if not name or key in seen:
+            continue
+        seen.add(key)
+        names.append(name)
+    return names
+
+
+def company_wifi_names_text(value: object) -> str:
+    return ", ".join(parse_company_wifi_names(value))
+
+
 def mode_label(mode: str) -> str:
     if mode == "internal":
         return "내부망"
@@ -410,8 +441,63 @@ def current_segment_info(settings: dict, when: dt.datetime | None = None) -> dic
     }
 
 
+def read_current_wifi_name(adapter: str) -> str:
+    try:
+        result = run_command(
+            ["netsh", "wlan", "show", "interfaces", f'name="{adapter}"'],
+            check=False,
+        )
+    except Exception:
+        logging.exception("현재 Wi-Fi 이름 확인 실패")
+        return ""
+    if result.returncode != 0:
+        return ""
+
+    current_interface = ""
+    for raw_line in result.stdout.splitlines():
+        if ":" not in raw_line:
+            continue
+        key, value = raw_line.split(":", 1)
+        key = key.strip()
+        value = value.strip()
+        if key == "Name":
+            current_interface = value
+            continue
+        if key == "SSID" and current_interface == adapter and value:
+            return value
+    return ""
+
+
+def current_decision_info(settings: dict, when: dt.datetime | None = None) -> dict:
+    schedule_info = current_segment_info(settings, when)
+    wifi_name = read_current_wifi_name(settings["adapter_name"])
+    company_wifi = settings.get("company_wifi", {})
+    company_wifi_names = parse_company_wifi_names(company_wifi.get("names", []))
+
+    info = dict(schedule_info)
+    info["source"] = "schedule"
+    info["source_label"] = "시간표"
+    info["wifi_name"] = wifi_name
+    info["company_wifi_names"] = company_wifi_names
+
+    if not company_wifi.get("enabled"):
+        return info
+
+    match_lookup = {name.casefold(): name for name in company_wifi_names}
+    matched_name = match_lookup.get(wifi_name.casefold()) if wifi_name else None
+    if not matched_name:
+        return info
+
+    info["mode"] = "internal"
+    info["segment_id"] = f"company_wifi|{schedule_info['segment_id']}"
+    info["source"] = "company_wifi"
+    info["source_label"] = f"회사 Wi-Fi 이름 일치 ({matched_name})"
+    info["matched_company_wifi_name"] = matched_name
+    return info
+
+
 def desired_mode_for(settings: dict, when: dt.datetime | None = None) -> str:
-    return current_segment_info(settings, when)["mode"]
+    return current_decision_info(settings, when)["mode"]
 
 
 def schedule_summary(settings: dict) -> str:
@@ -503,6 +589,12 @@ def validate_settings(settings: dict) -> None:
     validate_ipv4(internal["dns1"].strip(), "기본 DNS")
     validate_ipv4(internal["dns2"].strip(), "보조 DNS")
 
+    company_wifi = settings.get("company_wifi", {})
+    company_wifi_names = parse_company_wifi_names(company_wifi.get("names", []))
+    company_wifi["names"] = company_wifi_names
+    if company_wifi.get("enabled") and not company_wifi_names:
+        raise ValueError("회사 Wi-Fi 이름 기준을 쓰려면 이름을 하나 이상 입력해주십시오.")
+
     for day in DAY_KEYS:
         day_config = settings["schedule"]["days"][day]
         parse_time(day_config["start"])
@@ -546,7 +638,7 @@ def record_result(
 
 
 def mark_manual_override(settings: dict, mode: str, when: dt.datetime | None = None) -> None:
-    segment_info = current_segment_info(settings, when)
+    segment_info = current_decision_info(settings, when)
     settings["manual_override_segment_id"] = segment_info["segment_id"]
     settings["manual_override_mode"] = mode
     settings["manual_override_at"] = now_text()
@@ -640,7 +732,7 @@ def reconcile_now(settings: dict) -> str:
     if not settings.get("automation_enabled"):
         return "자동 루틴이 꺼져 있어 검사만 생략했습니다."
 
-    segment_info = current_segment_info(settings)
+    segment_info = current_decision_info(settings)
     desired = segment_info["mode"]
     current_segment_id = segment_info["segment_id"]
     clear_stale_manual_override(settings, current_segment_id)
@@ -801,6 +893,26 @@ def session_trigger_xml(trigger_kind: str, user_id_xml: str) -> str:
       <UserId>{user_id_xml}</UserId>
       <StateChange>{state_change}</StateChange>
     </SessionStateChangeTrigger>"""
+
+
+def wifi_event_subscription() -> str:
+    return (
+        "<QueryList>"
+        '<Query Id="0" Path="Microsoft-Windows-WLAN-AutoConfig/Operational">'
+        '<Select Path="Microsoft-Windows-WLAN-AutoConfig/Operational">'
+        "*[System[(EventID=8001 or EventID=8003)]]"
+        "</Select>"
+        "</Query>"
+        "</QueryList>"
+    )
+
+
+def wifi_event_trigger_xml() -> str:
+    subscription = html.escape(wifi_event_subscription())
+    return f"""    <EventTrigger>
+      <Enabled>true</Enabled>
+      <Subscription>{subscription}</Subscription>
+    </EventTrigger>"""
 
 
 def weekly_trigger_xml(day_key: str, time_value: dt.time) -> str:
@@ -967,6 +1079,8 @@ def build_task_xml_content(task_name: str, trigger_kind: str, command: str, argu
     </LogonTrigger>"""
     elif trigger_kind in {"unlock", "console"}:
         trigger_block = session_trigger_xml(trigger_kind, user_id_xml)
+    elif trigger_kind == "wifi_event":
+        trigger_block = wifi_event_trigger_xml()
     else:
         raise ValueError("알 수 없는 작업 트리거입니다.")
 
@@ -1028,6 +1142,15 @@ def create_task_via_schtasks(task_name: str, trigger_kind: str, command: str, ar
     task_run = f"{subprocess.list2cmdline([command])} {arguments}".strip()
     if trigger_kind == "logon":
         schedule_args = ["/SC", "ONLOGON"]
+    elif trigger_kind == "wifi_event":
+        schedule_args = [
+            "/SC",
+            "ONEVENT",
+            "/EC",
+            "Microsoft-Windows-WLAN-AutoConfig/Operational",
+            "/MO",
+            "*[System[(EventID=8001 or EventID=8003)]]",
+        ]
     else:
         raise RuntimeError("세션 상태 트리거는 schtasks 직접 등록이 지원되지 않습니다.")
 
@@ -1085,6 +1208,8 @@ def sync_tasks(settings: dict) -> None:
     create_task(TASK_LOGON, "logon", command, arguments)
     create_task(TASK_UNLOCK, "unlock", command, arguments)
     create_task(TASK_CONSOLE, "console", command, arguments)
+    if settings.get("company_wifi", {}).get("enabled"):
+        create_task(TASK_WIFI_EVENT, "wifi_event", command, arguments)
 
 
 def parse_list_fields(output: str) -> dict[str, str]:
@@ -1174,8 +1299,8 @@ class NetworkRoutineApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("900x540")
-        self.root.minsize(840, 500)
+        self.root.geometry("900x620")
+        self.root.minsize(840, 580)
         self.refresh_job: str | None = None
         self.startup_reconcile_job: str | None = None
 
@@ -1184,6 +1309,9 @@ class NetworkRoutineApp:
 
         self.adapter_var = tk.StringVar(value=self.settings["adapter_name"])
         self.automation_var = tk.BooleanVar(value=self.settings["automation_enabled"])
+        company_wifi = self.settings["company_wifi"]
+        self.company_wifi_enabled_var = tk.BooleanVar(value=company_wifi["enabled"])
+        self.company_wifi_names_var = tk.StringVar(value=company_wifi_names_text(company_wifi["names"]))
         self.base_start_var = tk.StringVar(value=self.settings["schedule"]["base_start"])
         self.base_end_var = tk.StringVar(value=self.settings["schedule"]["base_end"])
 
@@ -1245,8 +1373,18 @@ class NetworkRoutineApp:
             row=1, column=0, columnspan=2, padx=6, pady=6, sticky="w"
         )
 
+        ttk.Checkbutton(top, text="회사 Wi-Fi 이름 우선", variable=self.company_wifi_enabled_var).grid(
+            row=2, column=0, padx=6, pady=(0, 4), sticky="w"
+        )
+        ttk.Entry(top, textvariable=self.company_wifi_names_var, width=28).grid(
+            row=2, column=1, padx=6, pady=(0, 4), sticky="ew"
+        )
+        ttk.Label(top, text="여러 개면 쉼표로 구분").grid(
+            row=2, column=2, padx=6, pady=(0, 4), sticky="w"
+        )
+
         button_row = ttk.Frame(top)
-        button_row.grid(row=2, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 6))
+        button_row.grid(row=3, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 6))
         ttk.Button(button_row, text="지금 내부망", command=lambda: self.manual_apply("internal")).pack(
             side="left", padx=(0, 6)
         )
@@ -1256,8 +1394,8 @@ class NetworkRoutineApp:
 
         ttk.Label(
             top,
-            text="자동 루틴은 출근/퇴근 경계 시각과 로그인·복귀 시점에만 자동 처리합니다.",
-        ).grid(row=3, column=0, columnspan=3, padx=6, pady=(0, 6), sticky="w")
+            text="자동 루틴은 회사 Wi-Fi 이름 또는 시간표 기준으로 경계 시각, 로그인·복귀, Wi-Fi 연결 변경 시점에만 자동 처리합니다.",
+        ).grid(row=4, column=0, columnspan=3, padx=6, pady=(0, 6), sticky="w")
 
         compact_fields = [
             ("IP", self.ip_var, 0, 0),
@@ -1405,6 +1543,10 @@ class NetworkRoutineApp:
         settings = load_settings()
         settings["adapter_name"] = self.adapter_var.get().strip()
         settings["automation_enabled"] = self.automation_var.get()
+        settings["company_wifi"] = {
+            "enabled": self.company_wifi_enabled_var.get(),
+            "names": parse_company_wifi_names(self.company_wifi_names_var.get()),
+        }
         settings["schedule"]["base_start"] = self.base_start_var.get().strip()
         settings["schedule"]["base_end"] = self.base_end_var.get().strip()
         settings["internal"] = {
@@ -1429,6 +1571,7 @@ class NetworkRoutineApp:
         state_related_changed = (
             previous["adapter_name"] != updated["adapter_name"]
             or previous["internal"] != updated["internal"]
+            or previous["company_wifi"] != updated["company_wifi"]
             or previous["schedule"] != updated["schedule"]
         )
         if state_related_changed:
@@ -1474,20 +1617,25 @@ class NetworkRoutineApp:
     def current_runtime_text(self) -> str:
         try:
             preview = self.collect_form_settings()
-            segment_info = current_segment_info(preview)
-            current_target = segment_info["mode"]
+            decision_info = current_decision_info(preview)
+            current_target = decision_info["mode"]
             current_label = mode_label(current_target)
             summary = schedule_summary(preview)
-            if preview.get("manual_override_segment_id") == segment_info["segment_id"]:
+            if preview.get("manual_override_segment_id") == decision_info["segment_id"]:
                 control_text = f"수동 우선 {mode_label(preview.get('manual_override_mode') or current_target)}"
-            elif preview.get("last_handled_segment_id") == segment_info["segment_id"]:
+            elif preview.get("last_handled_segment_id") == decision_info["segment_id"]:
                 control_text = f"현재 시간대 자동 처리 완료 {current_label}"
             else:
                 control_text = f"현재 시간대 자동 처리 대기 {current_label}"
+
+            wifi_name = decision_info.get("wifi_name") or "-"
+            basis_text = decision_info.get("source_label") or "시간표"
             return (
                 f"예상 모드: {current_label} | "
                 f"자동 루틴: {'켜짐' if preview['automation_enabled'] else '꺼짐'} | "
                 f"어댑터: {preview['adapter_name'] or '-'} | "
+                f"현재 Wi-Fi 이름: {wifi_name} | "
+                f"기준: {basis_text} | "
                 f"시간표: {summary} | "
                 f"제어: {control_text}"
             )
@@ -1532,6 +1680,7 @@ class NetworkRoutineApp:
         logon = inspect_task(TASK_LOGON)
         unlock = inspect_task(TASK_UNLOCK)
         console = inspect_task(TASK_CONSOLE)
+        wifi_event = inspect_task(TASK_WIFI_EVENT)
 
         def format_task(prefix: str, info: dict) -> str:
             if not info["exists"]:
@@ -1544,6 +1693,11 @@ class NetworkRoutineApp:
             return (
                 f"{prefix}: 등록됨/{state}/결과 {result}/대상 {target}/배터리 {battery}/다음 {next_run}"
             )
+
+        def format_optional_task(prefix: str, info: dict, enabled: bool) -> str:
+            if not enabled:
+                return f"{prefix}: 사용 안 함"
+            return format_task(prefix, info)
 
         def format_resume_task() -> str:
             infos = [("잠금해제", unlock), ("콘솔", console)]
@@ -1564,7 +1718,9 @@ class NetworkRoutineApp:
 
         return (
             f"작업 상태 | {format_task('정시', schedule)} | "
-            f"{format_task('로그온', logon)} | {format_resume_task()}"
+            f"{format_task('로그온', logon)} | "
+            f"{format_optional_task('Wi-Fi', wifi_event, self.settings.get('company_wifi', {}).get('enabled', False))} | "
+            f"{format_resume_task()}"
         )
 
     def show_error(self, exc: Exception) -> None:
