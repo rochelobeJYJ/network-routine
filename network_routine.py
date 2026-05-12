@@ -12,6 +12,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -24,10 +25,13 @@ import win32com.client
 
 APP_TITLE = "네트워크 루틴"
 APP_FOLDER = "network_routine"
+APP_STORAGE_FOLDER = "NetworkRoutine"
+INSTALLED_EXE_NAME = "NetworkRoutine.exe"
 SETTINGS_NAME = "network_routine_settings.json"
 LOG_NAME = "network_routine.log"
 DEV_LOG_ENV = "NETWORK_ROUTINE_DEV_LOG"
 TASK_SCHEDULE = "NetworkRoutine_Reconcile_Schedule"
+TASK_STARTUP = "NetworkRoutine_Reconcile_Startup"
 TASK_LOGON = "NetworkRoutine_Reconcile_Logon"
 TASK_UNLOCK = "NetworkRoutine_Reconcile_Unlock"
 TASK_CONSOLE = "NetworkRoutine_Reconcile_ConsoleConnect"
@@ -45,7 +49,7 @@ TASK_TRIGGER_SESSION_STATE_CHANGE = 11
 TASK_SESSION_STATE_CONSOLE_CONNECT = 1
 TASK_SESSION_STATE_UNLOCK = 8
 UTF8_BOM = b"\xef\xbb\xbf"
-ROUTINE_TASKS = [TASK_SCHEDULE, TASK_LOGON, TASK_UNLOCK, TASK_CONSOLE, TASK_WIFI_EVENT]
+ROUTINE_TASKS = [TASK_SCHEDULE, TASK_STARTUP, TASK_LOGON, TASK_UNLOCK, TASK_CONSOLE, TASK_WIFI_EVENT]
 TASKS_TO_DELETE = [LEGACY_TASK_MINUTE, *ROUTINE_TASKS]
 DAY_XML_NAMES = {
     "mon": "Monday",
@@ -67,6 +71,15 @@ DAY_BITMASKS = {
 }
 
 DAY_KEYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+DECISION_MODE_SCHEDULE = "schedule"
+DECISION_MODE_HYBRID = "hybrid"
+DECISION_MODE_WIFI_ONLY = "wifi_only"
+DECISION_MODE_ITEMS = [
+    (DECISION_MODE_SCHEDULE, "시간표만"),
+    (DECISION_MODE_HYBRID, "시간표 + 네트워크 이름"),
+    (DECISION_MODE_WIFI_ONLY, "네트워크 이름만"),
+]
+DECISION_MODE_LABELS = dict(DECISION_MODE_ITEMS)
 DAY_LABELS = {
     "mon": "월",
     "tue": "화",
@@ -104,6 +117,11 @@ DEFAULT_SETTINGS = {
         "enabled": False,
         "names": [],
     },
+    "decision_mode": DECISION_MODE_SCHEDULE,
+    "wifi_rules": {
+        "internal_names": [],
+        "external_names": [],
+    },
     "last_handled_segment_id": "",
     "last_handled_mode": "",
     "last_handled_at": "",
@@ -122,12 +140,40 @@ def app_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+def data_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(os.environ.get("ProgramData", r"C:\ProgramData")) / APP_STORAGE_FOLDER
+    return app_dir()
+
+
+def install_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / APP_STORAGE_FOLDER
+    return app_dir()
+
+
+def installed_executable_path() -> Path:
+    if getattr(sys, "frozen", False):
+        return install_dir() / INSTALLED_EXE_NAME
+    return Path(sys.executable).resolve()
+
+
+def legacy_settings_path() -> Path | None:
+    legacy = app_dir() / SETTINGS_NAME
+    current = data_dir() / SETTINGS_NAME
+    return legacy if legacy != current else None
+
+
 def settings_path() -> Path:
-    return app_dir() / SETTINGS_NAME
+    return data_dir() / SETTINGS_NAME
 
 
 def log_path() -> Path:
-    return app_dir() / LOG_NAME
+    return data_dir() / LOG_NAME
+
+
+def ensure_directory(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
 
 
 def migrate_text_file_to_utf8_sig(path: Path) -> None:
@@ -161,6 +207,7 @@ def configure_logging() -> None:
         root_logger.addHandler(logging.NullHandler())
         return
 
+    ensure_directory(log_path().parent)
     migrate_text_file_to_utf8_sig(log_path())
     file_handler = logging.FileHandler(str(log_path()), encoding="utf-8-sig")
     file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
@@ -192,20 +239,26 @@ def deep_merge(default: object, loaded: object) -> object:
 
 def load_settings() -> dict:
     path = settings_path()
-    if not path.exists():
-        return json.loads(json.dumps(DEFAULT_SETTINGS))
+    source_path = path
+    legacy_path = legacy_settings_path()
+    if not source_path.exists() and legacy_path is not None and legacy_path.exists():
+        source_path = legacy_path
+    if not source_path.exists():
+        return normalize_settings_schema(json.loads(json.dumps(DEFAULT_SETTINGS)))
 
     try:
-        with path.open("r", encoding="utf-8") as file:
+        with source_path.open("r", encoding="utf-8") as file:
             loaded = json.load(file)
-        return deep_merge(DEFAULT_SETTINGS, loaded)
+        return normalize_settings_schema(deep_merge(DEFAULT_SETTINGS, loaded))
     except Exception as exc:
         logging.exception("설정 파일을 읽지 못했습니다.")
         raise RuntimeError(f"설정 파일을 읽지 못했습니다: {exc}") from exc
 
 
 def save_settings(data: dict) -> None:
+    data = normalize_settings_schema(data)
     path = settings_path()
+    ensure_directory(path.parent)
     temp_path = path.with_suffix(".tmp")
     with temp_path.open("w", encoding="utf-8") as file:
         json.dump(data, file, ensure_ascii=False, indent=2)
@@ -245,6 +298,22 @@ def relaunch_as_admin(extra_args: list[str] | None = None) -> None:
 def ensure_admin() -> None:
     if not is_admin():
         relaunch_as_admin()
+
+
+def ensure_runtime_copy() -> Path:
+    if not getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve()
+
+    source = Path(sys.executable).resolve()
+    target = installed_executable_path()
+    if source == target and target.exists():
+        return target
+
+    ensure_directory(target.parent)
+    temp_target = target.with_suffix(target.suffix + ".tmp")
+    shutil.copy2(source, temp_target)
+    temp_target.replace(target)
+    return target
 
 
 def decode_command_output(data: bytes | None) -> str:
@@ -352,7 +421,7 @@ def parse_time(value: str) -> dt.time:
         raise ValueError("시간은 HH:MM 형식으로 입력해주십시오.") from exc
 
 
-def parse_company_wifi_names(value: object) -> list[str]:
+def parse_name_list(value: object) -> list[str]:
     raw_items: list[str]
     if isinstance(value, list):
         raw_items = [str(item) for item in value]
@@ -373,8 +442,57 @@ def parse_company_wifi_names(value: object) -> list[str]:
     return names
 
 
+def names_text(value: object) -> str:
+    return ", ".join(parse_name_list(value))
+
+
+def parse_company_wifi_names(value: object) -> list[str]:
+    return parse_name_list(value)
+
+
 def company_wifi_names_text(value: object) -> str:
-    return ", ".join(parse_company_wifi_names(value))
+    return names_text(value)
+
+
+def decision_mode_label(mode: str) -> str:
+    return DECISION_MODE_LABELS.get(mode, DECISION_MODE_LABELS[DECISION_MODE_SCHEDULE])
+
+
+def decision_mode_value(label: str) -> str:
+    normalized = str(label).strip()
+    for value, item_label in DECISION_MODE_ITEMS:
+        if item_label == normalized:
+            return value
+    return DECISION_MODE_SCHEDULE
+
+
+def normalize_settings_schema(settings: dict) -> dict:
+    legacy_company_wifi = settings.get("company_wifi", {}) if isinstance(settings.get("company_wifi"), dict) else {}
+
+    decision_mode = str(settings.get("decision_mode") or "").strip().lower()
+    if decision_mode not in {DECISION_MODE_SCHEDULE, DECISION_MODE_HYBRID, DECISION_MODE_WIFI_ONLY}:
+        decision_mode = DECISION_MODE_HYBRID if legacy_company_wifi.get("enabled") else DECISION_MODE_SCHEDULE
+    settings["decision_mode"] = decision_mode
+
+    wifi_rules = settings.get("wifi_rules")
+    if not isinstance(wifi_rules, dict):
+        wifi_rules = {}
+        settings["wifi_rules"] = wifi_rules
+
+    internal_names = parse_name_list(
+        wifi_rules.get("internal_names", legacy_company_wifi.get("internal_names", legacy_company_wifi.get("names", [])))
+    )
+    external_names = parse_name_list(
+        wifi_rules.get("external_names", legacy_company_wifi.get("external_names", []))
+    )
+    wifi_rules["internal_names"] = internal_names
+    wifi_rules["external_names"] = external_names
+
+    settings["company_wifi"] = {
+        "enabled": decision_mode != DECISION_MODE_SCHEDULE and bool(internal_names),
+        "names": list(internal_names),
+    }
+    return settings
 
 
 def mode_label(mode: str) -> str:
@@ -382,6 +500,8 @@ def mode_label(mode: str) -> str:
         return "내부망"
     if mode == "external":
         return "외부망"
+    if not mode:
+        return "유지"
     return "-"
 
 
@@ -494,31 +614,66 @@ def read_current_wifi_name(adapter: str) -> str:
     return ""
 
 
+def wifi_rule_matches(settings: dict, wifi_name: str) -> dict:
+    wifi_rules = settings.get("wifi_rules", {})
+    internal_names = parse_name_list(wifi_rules.get("internal_names", []))
+    external_names = parse_name_list(wifi_rules.get("external_names", []))
+
+    internal_lookup = {name.casefold(): name for name in internal_names}
+    external_lookup = {name.casefold(): name for name in external_names}
+    wifi_key = wifi_name.casefold() if wifi_name else ""
+
+    return {
+        "internal_names": internal_names,
+        "external_names": external_names,
+        "matched_internal": internal_lookup.get(wifi_key) if wifi_key else None,
+        "matched_external": external_lookup.get(wifi_key) if wifi_key else None,
+    }
+
+
 def current_decision_info(settings: dict, when: dt.datetime | None = None) -> dict:
     schedule_info = current_segment_info(settings, when)
     wifi_name = read_current_wifi_name(settings["adapter_name"])
-    company_wifi = settings.get("company_wifi", {})
-    company_wifi_names = parse_company_wifi_names(company_wifi.get("names", []))
+    decision_mode = settings.get("decision_mode", DECISION_MODE_SCHEDULE)
+    wifi_match = wifi_rule_matches(settings, wifi_name)
 
     info = dict(schedule_info)
     info["source"] = "schedule"
     info["source_label"] = "시간표"
     info["wifi_name"] = wifi_name
-    info["company_wifi_names"] = company_wifi_names
+    info["decision_mode"] = decision_mode
+    info["internal_wifi_names"] = wifi_match["internal_names"]
+    info["external_wifi_names"] = wifi_match["external_names"]
 
-    if not company_wifi.get("enabled"):
+    if decision_mode == DECISION_MODE_SCHEDULE:
         return info
 
-    match_lookup = {name.casefold(): name for name in company_wifi_names}
-    matched_name = match_lookup.get(wifi_name.casefold()) if wifi_name else None
-    if not matched_name:
+    matched_internal = wifi_match["matched_internal"]
+    if matched_internal:
+        info["mode"] = "internal"
+        info["segment_id"] = f"wifi|internal|{matched_internal.casefold()}"
+        info["source"] = "wifi_internal"
+        info["source_label"] = f"내부망 이름 일치 ({matched_internal})"
+        info["matched_wifi_name"] = matched_internal
         return info
 
-    info["mode"] = "internal"
-    info["segment_id"] = f"company_wifi|{schedule_info['segment_id']}"
-    info["source"] = "company_wifi"
-    info["source_label"] = f"회사 Wi-Fi 이름 일치 ({matched_name})"
-    info["matched_company_wifi_name"] = matched_name
+    matched_external = wifi_match["matched_external"]
+    if matched_external:
+        info["mode"] = "external"
+        info["segment_id"] = f"wifi|external|{matched_external.casefold()}"
+        info["source"] = "wifi_external"
+        info["source_label"] = f"외부망 이름 일치 ({matched_external})"
+        info["matched_wifi_name"] = matched_external
+        return info
+
+    if decision_mode == DECISION_MODE_WIFI_ONLY:
+        wifi_key = wifi_name.casefold() if wifi_name else "-"
+        info["mode"] = ""
+        info["segment_id"] = f"wifi|none|{wifi_key}"
+        info["source"] = "wifi_none"
+        info["source_label"] = "일치하는 이름 없음"
+        return info
+
     return info
 
 
@@ -604,6 +759,7 @@ def external_commands(adapter: str) -> list[list[str]]:
 
 
 def validate_settings(settings: dict) -> None:
+    normalize_settings_schema(settings)
     adapter = settings["adapter_name"].strip()
     if not adapter:
         raise ValueError("적용할 네트워크 어댑터를 선택해주십시오.")
@@ -615,11 +771,22 @@ def validate_settings(settings: dict) -> None:
     validate_ipv4(internal["dns1"].strip(), "기본 DNS")
     validate_ipv4(internal["dns2"].strip(), "보조 DNS")
 
-    company_wifi = settings.get("company_wifi", {})
-    company_wifi_names = parse_company_wifi_names(company_wifi.get("names", []))
-    company_wifi["names"] = company_wifi_names
-    if company_wifi.get("enabled") and not company_wifi_names:
-        raise ValueError("회사 Wi-Fi 이름 기준을 쓰려면 이름을 하나 이상 입력해주십시오.")
+    decision_mode = settings.get("decision_mode", DECISION_MODE_SCHEDULE)
+    if decision_mode not in {DECISION_MODE_SCHEDULE, DECISION_MODE_HYBRID, DECISION_MODE_WIFI_ONLY}:
+        raise ValueError("자동 기준 설정이 올바르지 않습니다.")
+
+    wifi_rules = settings.get("wifi_rules", {})
+    internal_names = parse_name_list(wifi_rules.get("internal_names", []))
+    external_names = parse_name_list(wifi_rules.get("external_names", []))
+    wifi_rules["internal_names"] = internal_names
+    wifi_rules["external_names"] = external_names
+
+    if decision_mode != DECISION_MODE_SCHEDULE and not internal_names and not external_names:
+        raise ValueError("네트워크 이름 기준을 쓰려면 내부망 또는 외부망 이름을 하나 이상 입력해주십시오.")
+
+    duplicated_names = {name.casefold() for name in internal_names} & {name.casefold() for name in external_names}
+    if duplicated_names:
+        raise ValueError("같은 네트워크 이름을 내부망과 외부망에 동시에 넣을 수 없습니다.")
 
     for day in DAY_KEYS:
         day_config = settings["schedule"]["days"][day]
@@ -659,6 +826,26 @@ def record_result(
         settings["last_handled_segment_id"] = segment_info["segment_id"]
         settings["last_handled_mode"] = segment_info["mode"]
         settings["last_handled_at"] = settings["last_applied_at"]
+
+    save_settings(settings)
+
+
+def record_status_message(
+    settings: dict,
+    message: str,
+    *,
+    segment_info: dict | None = None,
+    mark_handled: bool = False,
+) -> None:
+    current_segment_id = segment_info["segment_id"] if segment_info else ""
+    if current_segment_id:
+        clear_stale_manual_override(settings, current_segment_id)
+
+    settings["last_message"] = message
+    if mark_handled and segment_info is not None:
+        settings["last_handled_segment_id"] = segment_info["segment_id"]
+        settings["last_handled_mode"] = segment_info.get("mode", "")
+        settings["last_handled_at"] = now_text()
 
     save_settings(settings)
 
@@ -766,8 +953,14 @@ def reconcile_now(settings: dict) -> str:
     if settings.get("manual_override_segment_id") == current_segment_id:
         manual_mode = settings.get("manual_override_mode") or desired
         message = f"수동 전환 유지: {mode_label(manual_mode)}"
-        settings["last_message"] = message
-        save_settings(settings)
+        record_status_message(settings, message)
+        return message
+
+    if not desired:
+        message = "일치하는 네트워크 이름이 없어 현재 상태를 유지합니다."
+        if settings.get("last_handled_segment_id") == current_segment_id:
+            return message
+        record_status_message(settings, message, segment_info=segment_info, mark_handled=True)
         return message
 
     if settings.get("last_handled_segment_id") == current_segment_id:
@@ -791,9 +984,10 @@ def reconcile_now(settings: dict) -> str:
     )
 
 
-def build_task_runner_action(extra_args: list[str]) -> tuple[str, str]:
+def build_task_runner_action(extra_args: list[str], executable_path: Path | None = None) -> tuple[str, str]:
     if getattr(sys, "frozen", False):
-        return sys.executable, subprocess.list2cmdline(extra_args)
+        runner = executable_path or Path(sys.executable).resolve()
+        return str(runner), subprocess.list2cmdline(extra_args)
     else:
         pythonw = Path(sys.executable).with_name("pythonw.exe")
         launcher = str(pythonw if pythonw.exists() else sys.executable)
@@ -978,7 +1172,7 @@ def configure_task_action(task_definition, command: str, arguments: str) -> None
     action = task_definition.Actions.Create(TASK_ACTION_EXEC)
     action.Path = command
     action.Arguments = arguments
-    action.WorkingDirectory = str(app_dir())
+    action.WorkingDirectory = str(Path(command).resolve().parent if Path(command).is_absolute() else app_dir())
 
 
 def create_task_via_com(task_name: str, trigger_kind: str, command: str, arguments: str) -> None:
@@ -1041,7 +1235,7 @@ def create_schedule_task_via_com(task_name: str, settings: dict, command: str, a
 
 def build_task_xml_document(task_name: str, trigger_blocks: list[str], command: str, arguments: str) -> str:
     user_id, _ = current_identity()
-    working_directory = str(app_dir())
+    working_directory = str(Path(command).resolve().parent if Path(command).is_absolute() else app_dir())
     author = html.escape(user_id)
     command_xml = html.escape(command)
     arguments_xml = html.escape(arguments)
@@ -1168,6 +1362,10 @@ def create_task_via_schtasks(task_name: str, trigger_kind: str, command: str, ar
     task_run = f"{subprocess.list2cmdline([command])} {arguments}".strip()
     if trigger_kind == "logon":
         schedule_args = ["/SC", "ONLOGON"]
+        extra_args = []
+    elif trigger_kind == "startup":
+        schedule_args = ["/SC", "ONSTART"]
+        extra_args = ["/RU", "SYSTEM"]
     elif trigger_kind == "wifi_event":
         schedule_args = [
             "/SC",
@@ -1177,17 +1375,22 @@ def create_task_via_schtasks(task_name: str, trigger_kind: str, command: str, ar
             "/MO",
             "*[System[(EventID=8001 or EventID=8003)]]",
         ]
+        extra_args = []
     else:
         raise RuntimeError("세션 상태 트리거는 schtasks 직접 등록이 지원되지 않습니다.")
 
     run_command(
-        ["schtasks", "/Create", "/TN", task_name, *schedule_args, "/TR", task_run, "/RL", "HIGHEST", "/F"],
+        ["schtasks", "/Create", "/TN", task_name, *schedule_args, *extra_args, "/TR", task_run, "/RL", "HIGHEST", "/F"],
         check=True,
     )
     logging.info("작업 등록(SCHTASKS): %s", task_name)
 
 
 def create_task(task_name: str, trigger_kind: str, command: str, arguments: str) -> None:
+    if trigger_kind == "startup":
+        create_task_via_schtasks(task_name, trigger_kind, command, arguments)
+        return
+
     try:
         create_task_via_com(task_name, trigger_kind, command, arguments)
         return
@@ -1222,19 +1425,36 @@ def create_schedule_task(task_name: str, settings: dict, command: str, arguments
         raise RuntimeError(f"자동 경계 시간 작업 등록에 실패했습니다: {exc}") from exc
 
 
+def uses_schedule_triggers(settings: dict) -> bool:
+    return settings.get("decision_mode", DECISION_MODE_SCHEDULE) != DECISION_MODE_WIFI_ONLY
+
+
+def uses_wifi_name_triggers(settings: dict) -> bool:
+    if settings.get("decision_mode", DECISION_MODE_SCHEDULE) == DECISION_MODE_SCHEDULE:
+        return False
+    wifi_rules = settings.get("wifi_rules", {})
+    return bool(parse_name_list(wifi_rules.get("internal_names", [])) or parse_name_list(wifi_rules.get("external_names", [])))
+
+
 def sync_tasks(settings: dict) -> None:
+    runner_path = None
+    if settings.get("automation_enabled"):
+        runner_path = ensure_runtime_copy() if getattr(sys, "frozen", False) else None
+
     for task_name in TASKS_TO_DELETE:
         delete_task(task_name)
 
     if not settings.get("automation_enabled"):
         return
 
-    command, arguments = build_task_runner_action(["--reconcile"])
-    create_schedule_task(TASK_SCHEDULE, settings, command, arguments)
+    command, arguments = build_task_runner_action(["--reconcile"], executable_path=runner_path)
+    if uses_schedule_triggers(settings):
+        create_schedule_task(TASK_SCHEDULE, settings, command, arguments)
+    create_task(TASK_STARTUP, "startup", command, arguments)
     create_task(TASK_LOGON, "logon", command, arguments)
     create_task(TASK_UNLOCK, "unlock", command, arguments)
     create_task(TASK_CONSOLE, "console", command, arguments)
-    if settings.get("company_wifi", {}).get("enabled"):
+    if uses_wifi_name_triggers(settings):
         create_task(TASK_WIFI_EVENT, "wifi_event", command, arguments)
 
 
@@ -1325,8 +1545,8 @@ class NetworkRoutineApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("1040x640")
-        self.root.minsize(960, 600)
+        self.root.geometry("1080x700")
+        self.root.minsize(1000, 650)
         self.refresh_job: str | None = None
         self.startup_reconcile_job: str | None = None
 
@@ -1335,9 +1555,10 @@ class NetworkRoutineApp:
 
         self.adapter_var = tk.StringVar(value=self.settings["adapter_name"])
         self.automation_var = tk.BooleanVar(value=self.settings["automation_enabled"])
-        company_wifi = self.settings["company_wifi"]
-        self.company_wifi_enabled_var = tk.BooleanVar(value=company_wifi["enabled"])
-        self.company_wifi_names_var = tk.StringVar(value=company_wifi_names_text(company_wifi["names"]))
+        wifi_rules = self.settings["wifi_rules"]
+        self.decision_mode_var = tk.StringVar(value=decision_mode_label(self.settings["decision_mode"]))
+        self.internal_wifi_names_var = tk.StringVar(value=names_text(wifi_rules["internal_names"]))
+        self.external_wifi_names_var = tk.StringVar(value=names_text(wifi_rules["external_names"]))
         self.base_start_var = tk.StringVar(value=self.settings["schedule"]["base_start"])
         self.base_end_var = tk.StringVar(value=self.settings["schedule"]["base_end"])
 
@@ -1399,18 +1620,33 @@ class NetworkRoutineApp:
             row=1, column=0, columnspan=2, padx=6, pady=6, sticky="w"
         )
 
-        ttk.Checkbutton(top, text="회사 Wi-Fi 이름 우선", variable=self.company_wifi_enabled_var).grid(
-            row=2, column=0, padx=6, pady=(0, 4), sticky="w"
+        ttk.Label(top, text="자동 기준").grid(row=2, column=0, padx=6, pady=(0, 4), sticky="w")
+        ttk.Combobox(
+            top,
+            textvariable=self.decision_mode_var,
+            state="readonly",
+            values=[label for _, label in DECISION_MODE_ITEMS],
+            width=24,
+        ).grid(row=2, column=1, padx=6, pady=(0, 4), sticky="ew")
+
+        ttk.Label(top, text="내부망 이름").grid(row=3, column=0, padx=6, pady=(0, 4), sticky="w")
+        ttk.Entry(top, textvariable=self.internal_wifi_names_var, width=34).grid(
+            row=3, column=1, padx=6, pady=(0, 4), sticky="ew"
         )
-        ttk.Entry(top, textvariable=self.company_wifi_names_var, width=34).grid(
-            row=2, column=1, padx=6, pady=(0, 4), sticky="ew"
+        ttk.Label(top, text="예: 회사1, 회사2").grid(
+            row=3, column=2, padx=6, pady=(0, 4), sticky="w"
         )
-        ttk.Label(top, text="여러 개면 쉼표로 구분").grid(
-            row=2, column=2, padx=6, pady=(0, 4), sticky="w"
+
+        ttk.Label(top, text="외부망 이름").grid(row=4, column=0, padx=6, pady=(0, 4), sticky="w")
+        ttk.Entry(top, textvariable=self.external_wifi_names_var, width=34).grid(
+            row=4, column=1, padx=6, pady=(0, 4), sticky="ew"
+        )
+        ttk.Label(top, text="예: 집WiFi, 핫스팟").grid(
+            row=4, column=2, padx=6, pady=(0, 4), sticky="w"
         )
 
         button_row = ttk.Frame(top)
-        button_row.grid(row=3, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 6))
+        button_row.grid(row=5, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 6))
         ttk.Button(button_row, text="지금 내부망", command=lambda: self.manual_apply("internal")).pack(
             side="left", padx=(0, 6)
         )
@@ -1420,10 +1656,10 @@ class NetworkRoutineApp:
 
         ttk.Label(
             top,
-            text="자동 루틴은 회사 Wi-Fi 이름 또는 시간표 기준으로 경계 시각, 로그인·복귀, Wi-Fi 연결 변경 때만 자동 처리합니다.",
-            wraplength=420,
+            text="자동 루틴은 설정한 기준에 따라 로그인·복귀·Wi-Fi 변경 때 다시 판단하고, 시간표를 쓰는 경우에는 경계 시각에도 자동 처리합니다.",
+            wraplength=460,
             justify="left",
-        ).grid(row=4, column=0, columnspan=3, padx=6, pady=(0, 6), sticky="ew")
+        ).grid(row=6, column=0, columnspan=3, padx=6, pady=(0, 6), sticky="ew")
 
         compact_fields = [
             ("IP", self.ip_var, 0, 0),
@@ -1498,13 +1734,13 @@ class NetworkRoutineApp:
         status = ttk.LabelFrame(outer, text="상태")
         status.pack(fill="x")
 
-        ttk.Label(status, textvariable=self.runtime_var, wraplength=980, justify="left").pack(
+        ttk.Label(status, textvariable=self.runtime_var, wraplength=1020, justify="left").pack(
             fill="x", padx=8, pady=(8, 4)
         )
-        ttk.Label(status, textvariable=self.task_var, wraplength=980, justify="left").pack(
+        ttk.Label(status, textvariable=self.task_var, wraplength=1020, justify="left").pack(
             fill="x", padx=8, pady=(0, 4)
         )
-        ttk.Label(status, textvariable=self.status_var, wraplength=980, justify="left").pack(
+        ttk.Label(status, textvariable=self.status_var, wraplength=1020, justify="left").pack(
             fill="x", padx=8, pady=(0, 8)
         )
 
@@ -1571,9 +1807,14 @@ class NetworkRoutineApp:
         settings = load_settings()
         settings["adapter_name"] = self.adapter_var.get().strip()
         settings["automation_enabled"] = self.automation_var.get()
+        settings["decision_mode"] = decision_mode_value(self.decision_mode_var.get())
+        settings["wifi_rules"] = {
+            "internal_names": parse_name_list(self.internal_wifi_names_var.get()),
+            "external_names": parse_name_list(self.external_wifi_names_var.get()),
+        }
         settings["company_wifi"] = {
-            "enabled": self.company_wifi_enabled_var.get(),
-            "names": parse_company_wifi_names(self.company_wifi_names_var.get()),
+            "enabled": settings["decision_mode"] != DECISION_MODE_SCHEDULE and bool(settings["wifi_rules"]["internal_names"]),
+            "names": list(settings["wifi_rules"]["internal_names"]),
         }
         settings["schedule"]["base_start"] = self.base_start_var.get().strip()
         settings["schedule"]["base_end"] = self.base_end_var.get().strip()
@@ -1599,7 +1840,8 @@ class NetworkRoutineApp:
         state_related_changed = (
             previous["adapter_name"] != updated["adapter_name"]
             or previous["internal"] != updated["internal"]
-            or previous["company_wifi"] != updated["company_wifi"]
+            or previous["decision_mode"] != updated["decision_mode"]
+            or previous["wifi_rules"] != updated["wifi_rules"]
             or previous["schedule"] != updated["schedule"]
         )
         if state_related_changed:
@@ -1649,6 +1891,7 @@ class NetworkRoutineApp:
             current_target = decision_info["mode"]
             current_label = mode_label(current_target)
             summary = schedule_summary(preview)
+            decision_text = decision_mode_label(preview.get("decision_mode", DECISION_MODE_SCHEDULE))
             if preview.get("manual_override_segment_id") == decision_info["segment_id"]:
                 control_text = f"수동 우선 {mode_label(preview.get('manual_override_mode') or current_target)}"
             elif preview.get("last_handled_segment_id") == decision_info["segment_id"]:
@@ -1661,6 +1904,7 @@ class NetworkRoutineApp:
             return (
                 f"예상 모드: {current_label} | "
                 f"자동 루틴: {'켜짐' if preview['automation_enabled'] else '꺼짐'} | "
+                f"자동 기준: {decision_text} | "
                 f"어댑터: {preview['adapter_name'] or '-'} | "
                 f"현재 Wi-Fi 이름: {wifi_name} | "
                 f"기준: {basis_text} | "
@@ -1705,6 +1949,7 @@ class NetworkRoutineApp:
 
     def current_task_text(self) -> str:
         schedule = inspect_task(TASK_SCHEDULE)
+        startup = inspect_task(TASK_STARTUP)
         logon = inspect_task(TASK_LOGON)
         unlock = inspect_task(TASK_UNLOCK)
         console = inspect_task(TASK_CONSOLE)
@@ -1745,9 +1990,10 @@ class NetworkRoutineApp:
             )
 
         return (
-            f"작업 상태 | {format_task('정시', schedule)} | "
+            f"작업 상태 | {format_optional_task('정시', schedule, uses_schedule_triggers(self.settings))} | "
+            f"{format_task('부팅', startup)} | "
             f"{format_task('로그온', logon)} | "
-            f"{format_optional_task('Wi-Fi', wifi_event, self.settings.get('company_wifi', {}).get('enabled', False))} | "
+            f"{format_optional_task('Wi-Fi', wifi_event, uses_wifi_name_triggers(self.settings))} | "
             f"{format_resume_task()}"
         )
 
