@@ -300,6 +300,16 @@ def ensure_admin() -> None:
         relaunch_as_admin()
 
 
+def open_settings_uri(uri: str) -> None:
+    result = ctypes.windll.shell32.ShellExecuteW(None, "open", uri, None, None, 1)
+    if result <= 32:
+        raise RuntimeError("Windows 설정 화면을 열지 못했습니다.")
+
+
+def open_location_settings() -> None:
+    open_settings_uri("ms-settings:privacy-location")
+
+
 def ensure_runtime_copy() -> Path:
     if not getattr(sys, "frozen", False):
         return Path(sys.executable).resolve()
@@ -454,6 +464,27 @@ def company_wifi_names_text(value: object) -> str:
     return names_text(value)
 
 
+def normalize_wifi_name(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return re.sub(r"\s+", " ", text).casefold()
+
+
+def summarize_wifi_names(names: list[str], limit: int = 4) -> str:
+    clean = [name for name in names if str(name).strip()]
+    if not clean:
+        return "-"
+    if len(clean) <= limit:
+        return ", ".join(clean)
+    return f"{', '.join(clean[:limit])} 외 {len(clean) - limit}개"
+
+
+def wifi_names_signature(names: list[str]) -> str:
+    normalized = sorted({normalize_wifi_name(name) for name in names if normalize_wifi_name(name)})
+    return "|".join(normalized) if normalized else "-"
+
+
 def decision_mode_label(mode: str) -> str:
     return DECISION_MODE_LABELS.get(mode, DECISION_MODE_LABELS[DECISION_MODE_SCHEDULE])
 
@@ -599,48 +630,92 @@ def read_current_wifi_name(adapter: str) -> str:
     if result.returncode != 0:
         return ""
 
-    current_interface = ""
     for raw_line in (result.stdout or "").splitlines():
-        if ":" not in raw_line:
-            continue
-        key, value = raw_line.split(":", 1)
-        key = key.strip()
-        value = value.strip()
-        if key == "Name":
-            current_interface = value
-            continue
-        if key == "SSID" and current_interface == adapter and value:
-            return value
+        match = re.match(r"^\s*SSID\s*:\s*(.*)$", raw_line, flags=re.IGNORECASE)
+        if match and match.group(1).strip():
+            return match.group(1).strip()
     return ""
 
 
-def wifi_rule_matches(settings: dict, wifi_name: str) -> dict:
+def read_visible_wifi_info(adapter: str) -> dict:
+    try:
+        result = run_command(
+            ["netsh", "wlan", "show", "networks", "mode=bssid", f'interface="{adapter}"'],
+            check=False,
+        )
+    except Exception:
+        logging.exception("주변 Wi-Fi 목록 확인 실패")
+        return {
+            "names": [],
+            "location_permission_required": False,
+            "elevation_required": False,
+        }
+
+    output = "\n".join(part for part in [result.stdout, result.stderr] if part).strip()
+    lowered = output.casefold()
+    location_permission_required = (
+        "location permission" in lowered
+        or "location services" in lowered
+        or "privacy-location" in lowered
+    )
+    elevation_required = "requires elevation" in lowered or "run as administrator" in lowered
+
+    names: list[str] = []
+    for raw_line in output.splitlines():
+        match = re.match(r"^\s*SSID\s+\d+\s*:\s*(.*)$", raw_line, flags=re.IGNORECASE)
+        if not match:
+            continue
+        name = match.group(1).strip()
+        if name and name not in names:
+            names.append(name)
+
+    return {
+        "names": names,
+        "location_permission_required": location_permission_required,
+        "elevation_required": elevation_required,
+    }
+
+
+def wifi_rule_matches(settings: dict, connected_wifi_name: str, visible_wifi_names: list[str]) -> dict:
     wifi_rules = settings.get("wifi_rules", {})
     internal_names = parse_name_list(wifi_rules.get("internal_names", []))
     external_names = parse_name_list(wifi_rules.get("external_names", []))
 
-    internal_lookup = {name.casefold(): name for name in internal_names}
-    external_lookup = {name.casefold(): name for name in external_names}
-    wifi_key = wifi_name.casefold() if wifi_name else ""
+    internal_lookup = {normalize_wifi_name(name): name for name in internal_names}
+    external_lookup = {normalize_wifi_name(name): name for name in external_names}
+    connected_key = normalize_wifi_name(connected_wifi_name)
+    visible_keys = {normalize_wifi_name(name) for name in visible_wifi_names if normalize_wifi_name(name)}
 
     return {
         "internal_names": internal_names,
         "external_names": external_names,
-        "matched_internal": internal_lookup.get(wifi_key) if wifi_key else None,
-        "matched_external": external_lookup.get(wifi_key) if wifi_key else None,
+        "matched_connected_internal": internal_lookup.get(connected_key) if connected_key else None,
+        "matched_connected_external": external_lookup.get(connected_key) if connected_key else None,
+        "matched_visible_internal": next(
+            (name for name in internal_names if normalize_wifi_name(name) in visible_keys),
+            None,
+        ),
+        "matched_visible_external": next(
+            (name for name in external_names if normalize_wifi_name(name) in visible_keys),
+            None,
+        ),
     }
 
 
 def current_decision_info(settings: dict, when: dt.datetime | None = None) -> dict:
     schedule_info = current_segment_info(settings, when)
     wifi_name = read_current_wifi_name(settings["adapter_name"])
+    visible_wifi_info = read_visible_wifi_info(settings["adapter_name"])
     decision_mode = settings.get("decision_mode", DECISION_MODE_SCHEDULE)
-    wifi_match = wifi_rule_matches(settings, wifi_name)
+    wifi_match = wifi_rule_matches(settings, wifi_name, visible_wifi_info["names"])
 
     info = dict(schedule_info)
     info["source"] = "schedule"
     info["source_label"] = "시간표"
     info["wifi_name"] = wifi_name
+    info["visible_wifi_names"] = visible_wifi_info["names"]
+    info["wifi_scan_location_permission_required"] = visible_wifi_info["location_permission_required"]
+    info["wifi_scan_elevation_required"] = visible_wifi_info["elevation_required"]
     info["decision_mode"] = decision_mode
     info["internal_wifi_names"] = wifi_match["internal_names"]
     info["external_wifi_names"] = wifi_match["external_names"]
@@ -648,30 +723,72 @@ def current_decision_info(settings: dict, when: dt.datetime | None = None) -> di
     if decision_mode == DECISION_MODE_SCHEDULE:
         return info
 
-    matched_internal = wifi_match["matched_internal"]
+    matched_internal = wifi_match["matched_connected_internal"]
     if matched_internal:
         info["mode"] = "internal"
         info["segment_id"] = f"wifi|internal|{matched_internal.casefold()}"
-        info["source"] = "wifi_internal"
-        info["source_label"] = f"내부망 이름 일치 ({matched_internal})"
+        info["source"] = "wifi_connected_internal"
+        info["source_label"] = f"연결 Wi-Fi 내부망 일치 ({matched_internal})"
         info["matched_wifi_name"] = matched_internal
         return info
 
-    matched_external = wifi_match["matched_external"]
+    matched_external = wifi_match["matched_connected_external"]
     if matched_external:
         info["mode"] = "external"
         info["segment_id"] = f"wifi|external|{matched_external.casefold()}"
-        info["source"] = "wifi_external"
-        info["source_label"] = f"외부망 이름 일치 ({matched_external})"
+        info["source"] = "wifi_connected_external"
+        info["source_label"] = f"연결 Wi-Fi 외부망 일치 ({matched_external})"
         info["matched_wifi_name"] = matched_external
         return info
 
-    if decision_mode == DECISION_MODE_WIFI_ONLY:
-        wifi_key = wifi_name.casefold() if wifi_name else "-"
+    matched_visible_internal = wifi_match["matched_visible_internal"]
+    matched_visible_external = wifi_match["matched_visible_external"]
+
+    if matched_visible_internal and not matched_visible_external:
+        info["mode"] = "internal"
+        info["segment_id"] = f"wifi-visible|internal|{matched_visible_internal.casefold()}"
+        info["source"] = "wifi_visible_internal"
+        info["source_label"] = f"감지 Wi-Fi 내부망 일치 ({matched_visible_internal})"
+        info["matched_wifi_name"] = matched_visible_internal
+        return info
+
+    if matched_visible_external and not matched_visible_internal:
+        info["mode"] = "external"
+        info["segment_id"] = f"wifi-visible|external|{matched_visible_external.casefold()}"
+        info["source"] = "wifi_visible_external"
+        info["source_label"] = f"감지 Wi-Fi 외부망 일치 ({matched_visible_external})"
+        info["matched_wifi_name"] = matched_visible_external
+        return info
+
+    if matched_visible_internal and matched_visible_external:
+        if decision_mode == DECISION_MODE_HYBRID:
+            info["source"] = "wifi_visible_ambiguous_schedule"
+            info["source_label"] = "내부망/외부망 이름이 함께 감지되어 시간표 사용"
+            return info
         info["mode"] = ""
-        info["segment_id"] = f"wifi|none|{wifi_key}"
-        info["source"] = "wifi_none"
-        info["source_label"] = "일치하는 이름 없음"
+        info["segment_id"] = f"wifi-visible|ambiguous|{wifi_names_signature(visible_wifi_info['names'])}"
+        info["source"] = "wifi_visible_ambiguous"
+        info["source_label"] = "내부망/외부망 이름이 함께 감지됨"
+        return info
+
+    if decision_mode == DECISION_MODE_WIFI_ONLY:
+        info["mode"] = ""
+        if info["wifi_scan_location_permission_required"]:
+            info["segment_id"] = "wifi-visible|permission"
+            info["source"] = "wifi_scan_permission"
+            info["source_label"] = "주변 Wi-Fi 검색 권한 필요"
+        elif visible_wifi_info["names"]:
+            info["segment_id"] = f"wifi-visible|none|{wifi_names_signature(visible_wifi_info['names'])}"
+            info["source"] = "wifi_none"
+            info["source_label"] = "감지된 Wi-Fi와 일치하는 이름 없음"
+        elif wifi_name:
+            info["segment_id"] = f"wifi|none|{normalize_wifi_name(wifi_name)}"
+            info["source"] = "wifi_connected_none"
+            info["source_label"] = "연결 Wi-Fi와 일치하는 이름 없음"
+        else:
+            info["segment_id"] = "wifi-visible|empty"
+            info["source"] = "wifi_visible_empty"
+            info["source_label"] = "감지된 Wi-Fi 없음"
         return info
 
     return info
@@ -957,7 +1074,15 @@ def reconcile_now(settings: dict) -> str:
         return message
 
     if not desired:
-        message = "일치하는 네트워크 이름이 없어 현재 상태를 유지합니다."
+        source = segment_info.get("source")
+        if source == "wifi_scan_permission":
+            message = "주변 Wi-Fi 검색 권한이 없어 상태를 유지합니다. Windows 위치 서비스를 켜주십시오."
+        elif source == "wifi_visible_ambiguous":
+            message = "내부망/외부망 이름이 함께 감지되어 상태를 유지합니다."
+        elif source == "wifi_visible_empty":
+            message = "감지된 Wi-Fi가 없어 상태를 유지합니다."
+        else:
+            message = "등록한 네트워크 이름과 일치하지 않아 현재 상태를 유지합니다."
         if settings.get("last_handled_segment_id") == current_segment_id:
             return message
         record_status_message(settings, message, segment_info=segment_info, mark_handled=True)
@@ -1549,6 +1674,7 @@ class NetworkRoutineApp:
         self.root.minsize(1000, 650)
         self.refresh_job: str | None = None
         self.startup_reconcile_job: str | None = None
+        self.location_permission_prompted = False
 
         self.settings = load_settings()
         self.adapter_choices = list_adapters()
@@ -1766,6 +1892,7 @@ class NetworkRoutineApp:
             message = reconcile_now(saved)
             self.settings = load_settings()
             self.refresh_runtime_labels()
+            self.maybe_prompt_location_permission(self.settings)
 
             is_noop = message.startswith("현재 시간 기준 유지:")
             if update_status_on_noop or not is_noop:
@@ -1859,6 +1986,40 @@ class NetworkRoutineApp:
             sync_tasks(updated)
         return updated
 
+    def maybe_prompt_location_permission(self, settings: dict | None = None, *, force: bool = False) -> None:
+        if self.location_permission_prompted and not force:
+            return
+
+        target_settings = settings or self.settings
+        decision_mode = target_settings.get("decision_mode", DECISION_MODE_SCHEDULE)
+        if decision_mode == DECISION_MODE_SCHEDULE:
+            return
+
+        try:
+            decision_info = current_decision_info(target_settings)
+        except Exception:
+            logging.exception("위치 권한 확인 실패")
+            return
+
+        if not decision_info.get("wifi_scan_location_permission_required"):
+            return
+
+        self.location_permission_prompted = True
+        should_open = messagebox.askyesno(
+            APP_TITLE,
+            "네트워크 이름 기준 자동 전환에는 Windows 위치 권한이 필요합니다.\n\n"
+            "지금 위치 권한 설정 화면을 열까요?",
+        )
+        if not should_open:
+            self.set_status("위치 권한이 없어 감지 Wi-Fi 기준 자동 전환이 제한됩니다.")
+            return
+
+        try:
+            open_location_settings()
+            self.set_status("Windows 위치 권한 설정 화면을 열었습니다.")
+        except Exception as exc:
+            self.show_error(exc)
+
     def manual_apply(self, mode: str) -> None:
         try:
             settings = self.persist_settings(sync_schedule_enabled=False)
@@ -1873,6 +2034,7 @@ class NetworkRoutineApp:
     def save_and_apply(self) -> None:
         try:
             settings = self.persist_settings(sync_schedule_enabled=True)
+            self.maybe_prompt_location_permission(settings)
             if settings["automation_enabled"]:
                 message = reconcile_now(settings)
             else:
@@ -1900,13 +2062,17 @@ class NetworkRoutineApp:
                 control_text = f"현재 시간대 자동 처리 대기 {current_label}"
 
             wifi_name = decision_info.get("wifi_name") or "-"
+            visible_wifi_text = summarize_wifi_names(decision_info.get("visible_wifi_names", []))
+            if decision_info.get("wifi_scan_location_permission_required"):
+                visible_wifi_text = "위치 권한 필요"
             basis_text = decision_info.get("source_label") or "시간표"
             return (
                 f"예상 모드: {current_label} | "
                 f"자동 루틴: {'켜짐' if preview['automation_enabled'] else '꺼짐'} | "
                 f"자동 기준: {decision_text} | "
                 f"어댑터: {preview['adapter_name'] or '-'} | "
-                f"현재 Wi-Fi 이름: {wifi_name} | "
+                f"연결 Wi-Fi: {wifi_name} | "
+                f"감지 Wi-Fi: {visible_wifi_text} | "
                 f"기준: {basis_text} | "
                 f"시간표: {summary} | "
                 f"제어: {control_text}"
